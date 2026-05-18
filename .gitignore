@@ -2,3 +2,9 @@
 llama_omni.egg-info/
 models/
 vocoder/
+experiment.ipynb
+My_learning.md
+requirements.txt
+sample_data/
+whisper_downloader.py
+.gradio/
