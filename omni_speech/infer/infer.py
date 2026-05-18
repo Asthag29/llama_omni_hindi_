@@ -15,6 +15,10 @@ from torch.utils.data import Dataset, DataLoader
 
 import math
 
+#! added inference for hindi tts
+from omni_speech.infer.hindi_tts import HindiTTSBridge
+
+hindi_bridge = HindiTTSBridge(device='cuda')
 
 def split_list(lst, n):
     """Split a list into n (roughly) equal-sized chunks"""
@@ -34,18 +38,18 @@ class CustomDataset(Dataset):
         self.tokenizer = tokenizer
         self.model_config = model_config
         self.input_type = input_type
-        self.mel_size = mel_size
-        self.conv_mode = conv_mode
+        self.mel_size = mel_size # size of the mel spectrogram
+        self.conv_mode = conv_mode #? mode of the conversation maybe speech or text
 
     def __getitem__(self, index):
-        item = self.questions[index]
-        speech_file = item["speech"]
-        qs = item["conversations"][0]["value"]
+        item = self.questions[index] #take one item from the list of questions
+        speech_file = item["speech"] #get the speech file from the item
+        qs = item["conversations"][0]["value"] #get the first element [0] and there is only one element in the list so we can use [0], value is the value of the conversation
 
         conv = conv_templates[self.conv_mode].copy()
-        conv.append_message(conv.roles[0], qs)
-        conv.append_message(conv.roles[1], None)
-        prompt = conv.get_prompt()
+        conv.append_message(conv.roles[0], qs) # if it's user then append the question to the conversation
+        conv.append_message(conv.roles[1], None) # if it's assistant then append None to the conversation
+        prompt = conv.get_prompt() # get the prompt from the conversation
 
         speech = whisper.load_audio(speech_file)
         if self.input_type == "raw":
@@ -143,6 +147,11 @@ def eval_model(args):
                 output_ids = outputs
 
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+        #! adding code here
+        audio_array = hindi_bridge.synthesize(outputs)
+        hindi_bridge.save(audio_array, f"audio_{idx}.wav")
+
+
         if args.s2s:
             output_units = ctc_postprocess(output_units, blank=model.config.unit_vocab_size)
 

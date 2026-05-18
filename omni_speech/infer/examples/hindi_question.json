@@ -1,0 +1,12 @@
+[
+{
+    "id": "hindi_sample",
+    "speech": "omni_speech/infer/examples/question_wav/hindi_sample.wav",
+    "conversations": [
+        {
+            "from": "human",
+            "value": "<speech>\nYou must respond only in Hindi (Devanagari script). कृपया हिंदी में उत्तर दें।"
+        }
+    ]
+}
+]

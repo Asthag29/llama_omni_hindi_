@@ -98,5 +98,15 @@
                 "value": "<speech>\nPlease directly answer the questions in the user's speech."
             }
         ]
+    },
+    {
+        "id": "hindi_sample",
+        "speech": "omni_speech/infer/examples/question_wav/hindi_sample.wav",
+        "conversations": [
+            {
+                "from": "human",
+                "value": "<speech>\nकृपया उपयोगकर्ता के भाषण में प्रश्नों का सीधे उत्तर दें।"
+            }
+        ]
     }
 ]

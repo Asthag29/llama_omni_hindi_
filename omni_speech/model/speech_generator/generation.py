@@ -19,7 +19,7 @@ from transformers.generation.utils import (
     GenerateDecoderOnlyOutput,
     GenerateNonBeamOutput,
     is_deepspeed_zero3_enabled,
-    is_torchdynamo_compiling,
+#    is_torchdynamo_compiling,
     NEED_SETUP_CACHE_CLASSES_MAPPING,
     QUANT_BACKEND_CLASSES_MAPPING,
     is_hqq_available,
@@ -30,6 +30,10 @@ from transformers.generation.utils import (
     logging
 )
 # from transformers.generation.stopping_criteria import validate_stopping_criteria
+try: 
+    from transformers.generation.utils import is_torchdynamo_compiling
+except ImportError:
+    from torch.compiler import is_dynamo_compiling as is_torchdynamo_compiling
 
 logger = logging.get_logger(__name__)
 
