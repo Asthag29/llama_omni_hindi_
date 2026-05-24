@@ -4,9 +4,12 @@ from trl import SFTTrainer
 from datasets import Dataset
 import json, torch
 
-model, tokenizer = lora_config()
+
 
 def train_llama_backbone():
+    model, tokenizer = lora_config()
+
+    
     training_args = TrainingArguments(
         output_dir='./checkpoints/hindi_lora',
         num_train_epochs=3,
@@ -18,7 +21,6 @@ def train_llama_backbone():
         logging_steps=10,
         save_steps=200,
         save_total_limit=3,
-        evaluation_strategy='steps',
         eval_steps=200,
         dataloader_num_workers=4,
         report_to='tensorboard',
@@ -26,19 +28,44 @@ def train_llama_backbone():
         optim='adamw_torch',
         max_grad_norm=1.0,
         )
+    
+    if training_args.gradient_checkpointing:
+        #* the trainer usually enable it by defualt but with lora it's safer todo this
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
     # Load your prepared data
-    with open('data/hindi_dataset_backbone.json', 'r') as f:
+    with open('data/hindi_dataset_backbone.json', 'r', encoding='utf-8') as f: #! why utf-8? for loading of hindi text
         train_data = json.load(f)
 
+    # making it into a HuggingFace Dataset
+    train_data = Dataset.from_list(train_data)
+
+    def process_data(examples):
+        text = tokenizer.apply_chat_template(examples["messages"], tokenize=False)
+        return {
+            "text": text,
+        }
+    
+    train_data = train_data.map(process_data, remove_columns=["messages"])
+    
+    
+   # print(train_data[0])
+
+
     trainer = SFTTrainer(
-        model=model,
+        model=model.to("cuda"),
         args=training_args,
-        train_dataset=train_data, tokenizer=tokenizer,
+        train_dataset=train_data,
+        tokenizer=tokenizer,
         max_seq_length=2048,
+        dataset_text_field="text",
         # wrap in HuggingFace Dataset
         )
     trainer.train()
     model.save_pretrained('./checkpoints/hindi_lora/final')
 
 if __name__ == "__main__":
+    
+    
     train_llama_backbone()

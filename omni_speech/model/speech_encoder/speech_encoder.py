@@ -4,7 +4,7 @@ import types
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+#! we have only used encoder of the whisper model , which is still produces audio tokens
 
 class WhisperWrappedEncoder:
     

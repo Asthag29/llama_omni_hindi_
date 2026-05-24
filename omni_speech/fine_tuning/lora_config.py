@@ -9,14 +9,17 @@ def lora_config():
     model_path = "./models/llama"
 
     #!automodel for causal lm reads the model architecture from the config file
-    model = LlamaForCausalLM.from_pretrained(model_path, device_map="auto",
+    model = LlamaForCausalLM.from_pretrained(
+    model_path, 
+
     ignore_mismatched_sizes=True,
-    torch_dtype=torch.float16,
+    torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2"
      )
-
+    model.to("cuda")
     #! tokenizer reads the tokenizer configuration 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer.pad_token = tokenizer.eos_token
 
     #* LoRA configuration
     lora_config = LoraConfig(
@@ -27,10 +30,15 @@ def lora_config():
         lora_dropout=0.05,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
+        
     )
 
     #* get the peft model(parameter efficient fine-tuning)
     model = get_peft_model(model, lora_config)
+    model.config.use_cache = False
+
+    #* required for the gradient flowing since the wwights are frozen and lora weights can't be trained without this
+    model.enable_input_require_grads()
     model.print_trainable_parameters()
 
     return model, tokenizer
