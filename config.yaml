@@ -1,0 +1,21 @@
+data: 
+  path: "/home/groups/ai/gupta/llama_hindi"
+
+model:
+  name: "llama"
+  path: "models/llama"
+
+fine_tuning:
+  num_train_epochs: 3
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 2e-4
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.05
+  bf16: true
+  fp16: false
+  logging_steps: 10
+  save_steps: 200
+  save_total_limit: 3
+  eval_steps: 200
+  dataloader_num_workers: 4

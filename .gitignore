@@ -10,3 +10,5 @@ whisper_downloader.py
 .gradio/
 data/
 checkpoints/
+experiments/
+indic.py
