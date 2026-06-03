@@ -1,6 +1,6 @@
 data: 
   path: "/home/groups/ai/gupta/llama_hindi"
-
+  
 model:
   name: "llama"
   path: "models/llama"
