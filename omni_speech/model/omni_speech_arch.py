@@ -13,7 +13,8 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-from abc import ABC, abstractmethod
+#* abstract base class (ABC) is a class that cannot be instantiated, without implementing all the abstract methods(required methods)
+from abc import ABC, abstractmethod 
 
 import torch
 
@@ -23,8 +24,9 @@ from omni_speech.constants import IGNORE_INDEX, SPEECH_TOKEN_INDEX
 from omni_speech.utils import lengths_to_padding_mask
 
 
+#! class which defines the actual architecture(this is the model itself)that includes the speech encoder and projector(not actually processing logic of the speech, just building the model)
 class OmniSpeechMetaModel:
-
+    #* init method initilizes this method whenever you create a new object of this class without actually calling it
     def __init__(self, config):
         super(OmniSpeechMetaModel, self).__init__(config)
 
@@ -32,16 +34,18 @@ class OmniSpeechMetaModel:
             self.speech_encoder = build_speech_encoder(config)
             self.speech_projector = build_speech_projector(config)
 
+## todo: why is this needed? 
     def get_speech_encoder(self):
         speech_encoder = getattr(self, 'speech_encoder', None)
         if type(speech_encoder) is list:
-            speech_encoder = speech_encoder[0]
+            speech_encoder = speech_encoder[0] #!used for multigpu training, 
         return speech_encoder
 
+## todo: fdps is related to multigpu data parallelism(fully sharded data parallelism)
     def initialize_speech_modules(self, model_args, fsdp=None):
-        self.config.speech_encoder = getattr(model_args, "speech_encoder", None)
-        self.config.speech_encoder_type = getattr(model_args, "speech_encoder_type", None)
-        self.config.speech_projector_type = getattr(model_args, 'speech_projector_type', 'linear')
+        self.config.speech_encoder = getattr(model_args, "speech_encoder", None) #* it is the checkpoint path for the speech encoder
+        self.config.speech_encoder_type = getattr(model_args, "speech_encoder_type", None) #* name of the model type like whisper, etc.
+        self.config.speech_projector_type = getattr(model_args, 'speech_projector_type', 'linear') #* can make nonlinear as well
         self.config.speech_encoder_ds_rate = getattr(model_args, 'speech_encoder_ds_rate', 5)
         self.config.speech_encoder_hidden_size = getattr(model_args, 'speech_encoder_hidden_size', 1280)
 
@@ -66,7 +70,7 @@ class OmniSpeechMetaModel:
 
             self.speech_projector.load_state_dict(get_w(pretrain_speech_projector_weights, 'speech_projector'))
 
-
+#! class doing the actual processing of the speech and text
 class OmniSpeechMetaForCausalLM(ABC):
 
     @abstractmethod
@@ -101,6 +105,7 @@ class OmniSpeechMetaForCausalLM(ABC):
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
         speech, speech_lengths
     ):
+    #! if there is no speech then it falls back to the text mode 
         speech_encoder = self.get_speech_encoder()
         if speech_encoder is None or speech is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels

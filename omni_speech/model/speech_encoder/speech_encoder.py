@@ -4,7 +4,7 @@ import types
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-#! we have only used encoder of the whisper model , which is still produces audio tokens
+#! we have only used encoder of the whisper model , which still produces audio tokens
 
 class WhisperWrappedEncoder:
     
@@ -26,3 +26,17 @@ class WhisperWrappedEncoder:
         encoder = whisper.load_model(name=model_config.speech_encoder, device='cpu').encoder
         replace_layer_norm(encoder)
         return encoder
+
+
+if __name__ == "__main__":
+    from types import SimpleNamespace
+
+    model_config = SimpleNamespace(
+        speech_encoder="large-v3",          # passed to whisper.load_model(name=...)
+        speech_encoder_type="whisper",      # only needed if you use build_speech_encoder()
+        speech_encoder_hidden_size=1280,    # Whisper large encoder output dim
+        speech_encoder_ds_rate=5,           # used by speech projector downstream
+    )
+
+    encoder = WhisperWrappedEncoder.load(model_config)
+    print(encoder)
