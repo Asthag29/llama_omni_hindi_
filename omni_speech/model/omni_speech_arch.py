@@ -40,19 +40,20 @@ class OmniSpeechMetaModel:
         if type(speech_encoder) is list:
             speech_encoder = speech_encoder[0] #!used for multigpu training, 
         return speech_encoder
-
+## todo: need to loook into model arguments
 ## todo: fdps is related to multigpu data parallelism(fully sharded data parallelism)
     def initialize_speech_modules(self, model_args, fsdp=None):
         self.config.speech_encoder = getattr(model_args, "speech_encoder", None) #* it is the checkpoint path for the speech encoder
         self.config.speech_encoder_type = getattr(model_args, "speech_encoder_type", None) #* name of the model type like whisper, etc.
-        self.config.speech_projector_type = getattr(model_args, 'speech_projector_type', 'linear') #* can make nonlinear as well
+        self.config.speech_projector_type = getattr(model_args, 'speech_projector_type', 'linear') #* can make nonlinear as well, if we write code for it
         self.config.speech_encoder_ds_rate = getattr(model_args, 'speech_encoder_ds_rate', 5)
         self.config.speech_encoder_hidden_size = getattr(model_args, 'speech_encoder_hidden_size', 1280)
 
+        #* just guards against the fallback to none
         if self.get_speech_encoder() is None:
             speech_encoder = build_speech_encoder(self.config)
             if fsdp is not None and len(fsdp) > 0:
-                self.speech_encoder = [speech_encoder]
+                self.speech_encoder = [speech_encoder]  #*making it a list for multigpu training
             else:
                 self.speech_encoder = speech_encoder
 
@@ -60,17 +61,21 @@ class OmniSpeechMetaModel:
             self.speech_projector = build_speech_projector(self.config)
         else:
             # In case it is frozen by LoRA
+            ## todo: might be useful for later training stage
             for p in self.speech_projector.parameters():
-                p.requires_grad = True
+                p.requires_grad = True  #*unfreezing the speech projector
 
+        #* loading the weights for the speech projector
         if model_args.pretrain_speech_projector is not None:
             pretrain_speech_projector_weights = torch.load(model_args.pretrain_speech_projector, map_location='cpu')
+            ## todo: need to understand this later
             def get_w(weights, keyword):
-                return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
+                return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k} #* returns a dictionary
 
-            self.speech_projector.load_state_dict(get_w(pretrain_speech_projector_weights, 'speech_projector'))
+            self.speech_projector.load_state_dict(get_w(pretrain_speech_projector_weights, 'speech_projector')) #* essentially removing the name speech_encoder from the weights
 
 #! class doing the actual processing of the speech and text
+#* whoever inherits from this class, must implement the get_model method
 class OmniSpeechMetaForCausalLM(ABC):
 
     @abstractmethod
@@ -78,28 +83,32 @@ class OmniSpeechMetaForCausalLM(ABC):
         pass
 
     def get_speech_encoder(self):
-        return self.get_model().get_speech_encoder()
+        return self.get_model().get_speech_encoder() #* whatever the model is, it must have the get_speech_encoder method
     
     def get_speech_projector(self):
-        return self.get_model().speech_projector
+        return self.get_model().speech_projector #* whatever the model is, it must have the speech_projector attribute
 
     def encode_speech(self, speech, speech_lengths):
-        speech_encoder_type = self.config.speech_encoder_type
+        speech_encoder_type = self.config.speech_encoder_type #* name of the model type like whisper, etc.
         speech_encoder = self.get_speech_encoder()
         if "whisper" in speech_encoder_type.lower():
             encoder_outs = speech_encoder(speech.permute(0, 2, 1))
-            speech_lengths = (speech_lengths + 1) // 2
+            speech_lengths = (speech_lengths + 1) // 2 #* becuase whisper encoder half the time dimension 
         else:
             raise ValueError(f'Unknown speech encoder: {speech_encoder}')
         speech_projector_type = self.config.speech_projector_type
         speech_projector = self.get_speech_projector()
         if speech_projector_type == "linear":
             encoder_outs = speech_projector(encoder_outs)
-            speech_lengths = speech_lengths // speech_projector.k
+
+            speech_lengths = speech_lengths // speech_projector.k #* k is the downsampling rate of the speech encoder, and speech_lenth is the actual speech length without padding 
         else:
             raise ValueError(f'Unknown speech projector: {speech_projector_type}')
+            #* speech features/channels are only upto the speech length
+            #* b = 10  --> [[c1,t1], [c2,t2], [c3,t3], ... [c10,t10]] --> encoder_outs[i] is [c1,c2,c3, ... c10] the value itself 
         speech_features = [encoder_outs[i, :speech_lengths[i]] for i in range(len(encoder_outs))]
-        return speech_features
+        #* shape is [speech_length, hidden_size/time ]
+        return speech_features 
 
     def prepare_inputs_labels_for_speech_and_text(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,

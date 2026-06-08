@@ -23,10 +23,10 @@ from PIL import Image
 
 class SeparatorStyle(Enum):
     """Different separator style."""
-    TWO = auto()
-    PLAIN = auto()
-    LLAMA_2 = auto()
-    LLAMA_3 = auto()
+    TWO = auto()  #* automatically assign a unique integer to each enum value, default order is 1,2,3,...
+    PLAIN = auto()  #* automatically assign a unique integer to each enum value, default order is 1,2,3,...
+    LLAMA_2 = auto()  #* automatically assign a unique integer to each enum value, default order is 1,2,3,...
+    LLAMA_3 = auto()  #* automatically assign a unique integer to each enum value, default order is 1,2,3,...
 
 
 @dataclasses.dataclass
@@ -49,6 +49,18 @@ class Conversation:
     stop_token_ids: List[int] = None
 
     skip_next: bool = False
+
+#* dataset structure (messages)looks like this:
+#* [
+#*     [
+#*         role ,user,
+#*         content, "Hello, how are you?"
+#*     ],
+#*     [
+#*         role ,assistant,
+#*         content, "I'm good, thank you!"
+#*     ]
+#* ]
 
     def get_prompt(self):
         messages = self.messages
@@ -112,6 +124,7 @@ class Conversation:
 
         return ret
 
+## todo: maybe for adding new message
     def append_message(self, role, message):
         self.messages.append([role, message])
     
@@ -157,7 +170,7 @@ class Conversation:
             "sep": self.sep,
             "sep2": self.sep2,
         }
-
+#* single string
 conv_vicuna_v1 = Conversation(
     system="A chat between a curious user and an artificial intelligence assistant. " "The assistant gives helpful, detailed, and polite answers to the user's questions.",
     roles=("USER", "ASSISTANT"),
@@ -212,4 +225,4 @@ conv_templates = {
 
 
 if __name__ == "__main__":
-    print(default_conversation.get_prompt())
+    print(default_conversation.default_conversation())

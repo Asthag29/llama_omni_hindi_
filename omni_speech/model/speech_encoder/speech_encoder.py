@@ -28,15 +28,26 @@ class WhisperWrappedEncoder:
         return encoder
 
 
-if __name__ == "__main__":
-    from types import SimpleNamespace
-
-    model_config = SimpleNamespace(
-        speech_encoder="large-v3",          # passed to whisper.load_model(name=...)
-        speech_encoder_type="whisper",      # only needed if you use build_speech_encoder()
-        speech_encoder_hidden_size=1280,    # Whisper large encoder output dim
-        speech_encoder_ds_rate=5,           # used by speech projector downstream
-    )
-
-    encoder = WhisperWrappedEncoder.load(model_config)
-    print(encoder)
+#! will print the model architecture
+#* AudioEncoder(
+#   (conv1): Conv1d(128, 1280, kernel_size=(3,), stride=(1,), padding=(1,))
+#   (conv2): Conv1d(1280, 1280, kernel_size=(3,), stride=(2,), padding=(1,))
+#   (blocks): ModuleList(
+#     (0-31): 32 x ResidualAttentionBlock(
+#       (attn): MultiHeadAttention(
+#         (query): Linear(in_features=1280, out_features=1280, bias=True)
+#         (key): Linear(in_features=1280, out_features=1280, bias=False)
+#         (value): Linear(in_features=1280, out_features=1280, bias=True)
+#         (out): Linear(in_features=1280, out_features=1280, bias=True)
+#       )
+#       (attn_ln): LayerNorm((1280,), eps=1e-05, elementwise_affine=True)
+#       (mlp): Sequential(
+#         (0): Linear(in_features=1280, out_features=5120, bias=True)
+#         (1): GELU(approximate='none')
+#         (2): Linear(in_features=5120, out_features=1280, bias=True)
+#       )
+#       (mlp_ln): LayerNorm((1280,), eps=1e-05, elementwise_affine=True)
+#     )
+#   )
+#   (ln_post): LayerNorm((1280,), eps=1e-05, elementwise_affine=True)
+# )

@@ -26,6 +26,8 @@ from transformers.generation.utils import GenerateOutput
 
 from ..omni_speech_arch import OmniSpeechMetaModel, OmniSpeechMetaForCausalLM
 
+#* autoconfig loads model architecture rather than model weights
+
 #general MRO structure : class itself, then parent class and all its parents , then second parent class and all its parents, etc.object at the last 
 #* llamamodel = llmaa encoder model with all the attention heads, but has no LM head for text generation(prediction),outputs hidden states
 #* llamaforcausalmodel = llama model + LM head for text generation(prediction),outputs logits
@@ -48,6 +50,7 @@ class OmniSpeechLlamaForCausalLM(LlamaForCausalLM, OmniSpeechMetaForCausalLM):
 
     def __init__(self, config):
         super(LlamaForCausalLM, self).__init__(config)
+        #! replaces the llama model with the omni speech llama model
         self.model = OmniSpeechLlamaModel(config)
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
