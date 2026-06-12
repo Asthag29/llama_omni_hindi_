@@ -1,0 +1,42 @@
+data:
+  path: /home/groups/ai/gupta/llama_hindi
+  json_path: ${data.path}/combined_dataset.json
+  audio_root: null
+  validation_split: 0.05
+  seed: 42
+  input_type: mel
+  mel_size: 128
+  num_workers: 4
+model:
+  name: llama
+  path: models/llama
+  config_path: models/llama
+  model_base: models/llama
+  tokenizer_path: null
+  model_max_length: 2048
+training:
+  num_train_epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0002
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  precision: 16-mixed
+  accelerator: auto
+  devices: auto
+  strategy: auto
+  log_every_n_steps: 10
+  val_check_interval: 1.0
+  fast_dev_run: false
+logging:
+  output_dir: outputs/training
+  tensorboard: true
+  csv: true
+  wandb: false
+  wandb_project: llama-omni-training
+  wandb_run_name: null
+  checkpoint_monitor: val_loss
+  save_top_k: 2
+  save_last: true

@@ -1,21 +1,52 @@
-data: 
-  path: "/home/groups/ai/gupta/llama_hindi"
+data:
+  path: "/home/groups/ai/gupta/datasets/llama_hindi"
+  json_path: "${data.path}/manifestss.json"
+  audio_root: null
+  validation_split: 0.05
+  seed: 42
+  input_type: "mel"
+  mel_size: 128
+  num_workers: 4
   
 model:
   name: "llama"
   path: "models/llama"
+  config_path: "models/llama"
+  model_base: "models/llama"
+  tokenizer_path: null
+  model_max_length: 2048
 
-fine_tuning:
+training:
   num_train_epochs: 3
-  per_device_train_batch_size: 2
+  batch_size: 2
   gradient_accumulation_steps: 8
   learning_rate: 2e-4
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.05
-  bf16: true
-  fp16: false
-  logging_steps: 10
-  save_steps: 200
-  save_total_limit: 3
-  eval_steps: 200
-  dataloader_num_workers: 4
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  precision: "16-mixed"
+  accelerator: "auto"
+  devices: "auto"
+  strategy: "auto"
+  log_every_n_steps: 10
+  val_check_interval: 1.0
+  fast_dev_run: false
+
+logging:
+  output_dir: "outputs/training"
+  tensorboard: true
+  csv: true
+  wandb: false
+  wandb_project: "llama-omni-training"
+  wandb_run_name: null
+  checkpoint_monitor: "val_loss"
+  save_top_k: 2
+  save_last: true
+
+hydra:
+  run:
+    dir: ${logging.output_dir}/hydra/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ${logging.output_dir}/hydra_sweeps
+    subdir: ${hydra.job.num}

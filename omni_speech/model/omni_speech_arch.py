@@ -15,13 +15,10 @@
 
 #* abstract base class (ABC) is a class that cannot be instantiated, without implementing all the abstract methods(required methods)
 from abc import ABC, abstractmethod 
-
 import torch
-
 from .speech_encoder.builder import build_speech_encoder
 from .speech_projector.builder import build_speech_projector
 from omni_speech.constants import IGNORE_INDEX, SPEECH_TOKEN_INDEX
-from omni_speech.utils import lengths_to_padding_mask
 
 
 #! class which defines the actual architecture(this is the model itself)that includes the speech encoder and projector(not actually processing logic of the speech, just building the model)
@@ -137,6 +134,14 @@ class OmniSpeechMetaForCausalLM(ABC):
         if labels is None:
             labels = torch.full_like(input_ids, IGNORE_INDEX)
 
+        #* If the padded batch length is 10, but one sample has real length 7, then for right padding:
+
+        #*attention_mask = [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]
+        #*position_ids    = [0, 1, 2, 3, 4, 5, 6, 0, 0, 0]
+        #* The 0s at the end are padding and should not be attended to.
+        #* attention_mask: which positions are real vs padding.
+        #* position_ids tells LLaMA the position number of each real embedding in the sequence. LLaMA uses positional information, via rotary position embeddings, so the model needs to know: “this is token/frame position 0, this is position 1, etc.”
+
         # remove the padding using attention_mask -- FIXME
         _input_ids = input_ids
         input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
@@ -147,16 +152,16 @@ class OmniSpeechMetaForCausalLM(ABC):
         cur_speech_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_speech = (cur_input_ids == SPEECH_TOKEN_INDEX).sum()
-            if num_speech == 0:
-                cur_speech_features = speech_features[cur_speech_idx]
+            if num_speech == 0: #* when there is no speech 
+                cur_speech_features = speech_features[cur_speech_idx]   ## todo: need to understand this later
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
-                cur_input_embeds = torch.cat([cur_input_embeds_1, cur_speech_features[0:0]], dim=0)
+                cur_input_embeds = torch.cat([cur_input_embeds_1, cur_speech_features[0:0]], dim=0) #* cur_speech_features[0:0] is an empty tensor 
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
                 cur_speech_idx += 1
                 continue
 
-            speech_token_indices = [-1] + torch.where(cur_input_ids == SPEECH_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
+            speech_token_indices = [-1] + torch.where(cur_input_ids == SPEECH_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]  #* adding the start and end of the speech tokens
             cur_input_ids_nospeech = []
             cur_labels = labels[batch_idx]
             cur_labels_nospeech = []
@@ -169,6 +174,7 @@ class OmniSpeechMetaForCausalLM(ABC):
             cur_new_input_embeds = []
             cur_new_labels = []
 
+            #* sticking the speech features to the imput embeddings, they are not concatenated, but rather added as a separate tensor, in place of the speech tokens 
             for i in range(num_speech + 1):
                 cur_new_input_embeds.append(cur_input_embeds_no_speech[i])
                 cur_new_labels.append(cur_labels_nospeech[i])
@@ -187,7 +193,7 @@ class OmniSpeechMetaForCausalLM(ABC):
             new_labels.append(cur_new_labels)
 
         # Truncate sequences to max length as speech features can make the sequence longer
-        tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)
+        tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)  #* truncating the sequence if it is longer than the tokenizer model max length
         if tokenizer_model_max_length is not None:
             new_input_embeds = [x[:tokenizer_model_max_length] for x in new_input_embeds]
             new_labels = [x[:tokenizer_model_max_length] for x in new_labels]
@@ -198,7 +204,7 @@ class OmniSpeechMetaForCausalLM(ABC):
 
         new_input_embeds_padded = []
         new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
-        attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device) #* attention mask is used as a mask for distinguishing between real and padded tokens, 
         position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
 
         for i, (cur_new_embed, cur_new_labels) in enumerate(zip(new_input_embeds, new_labels)):
@@ -238,3 +244,5 @@ class OmniSpeechMetaForCausalLM(ABC):
             position_ids = None
 
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
+
+
