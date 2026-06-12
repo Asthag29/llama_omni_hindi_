@@ -26,6 +26,7 @@ from transformers.generation.utils import GenerateOutput
 
 from ..omni_speech_arch import OmniSpeechMetaModel, OmniSpeechMetaForCausalLM
 
+#* omniSpeechMetaModle is the model arcgitecture(with encoder and projector) and omniSpeechMetaForCausalLM is the actual processing logic of the speech and text
 #* autoconfig loads model architecture rather than model weights
 
 #general MRO structure : class itself, then parent class and all its parents , then second parent class and all its parents, etc.object at the last 
@@ -35,9 +36,6 @@ from ..omni_speech_arch import OmniSpeechMetaModel, OmniSpeechMetaForCausalLM
 class OmniSpeechConfig(LlamaConfig):
     model_type = "omni_speech_llama"
 
-#? omni speech meta model is essentially a arcgitecture class that adds the speech encoder and projector 
-#* llama model + omni speech meta model = omni speech llama model
-#! it is essentiall
 class OmniSpeechLlamaModel(OmniSpeechMetaModel, LlamaModel):
     config_class = OmniSpeechConfig
 
@@ -50,15 +48,15 @@ class OmniSpeechLlamaForCausalLM(LlamaForCausalLM, OmniSpeechMetaForCausalLM):
 
     def __init__(self, config):
         super(LlamaForCausalLM, self).__init__(config)
-        #! replaces the llama model with the omni speech llama model
+       #* defining the model as the omni speech llama model(which has inhertance from omnispeeech meta{all the processing logic})
         self.model = OmniSpeechLlamaModel(config)
-        self.pretraining_tp = config.pretraining_tp
-        self.vocab_size = config.vocab_size
+        self.pretraining_tp = config.pretraining_tp #* pretraining tensor parallelism
+        self.vocab_size = config.vocab_size #* vocabulary size
         #! adding the LM head to the model(text generation)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False) #* linear layer to project the hidden states to the vocabulary size
 
         # Initialize weights and apply final processing
-        self.post_init()
+        self.post_init() #* initialize the weights and apply final processing
 
     def get_model(self):
         return self.model
@@ -110,6 +108,7 @@ class OmniSpeechLlamaForCausalLM(LlamaForCausalLM, OmniSpeechMetaForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict
         )
+
 
     @torch.no_grad()
     def generate(

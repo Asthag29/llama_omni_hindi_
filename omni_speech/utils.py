@@ -224,6 +224,7 @@ def lengths_to_mask(lens):
     return ~lengths_to_padding_mask(lens)
 
 
+#* disabling the redundant torch default initialization to accelerate model creation.
 def disable_torch_init():
     """
     Disable the redundant torch default initialization to accelerate model creation.
