@@ -12,3 +12,6 @@ data/
 checkpoints/
 experiments/
 indic.py
+
+logs/
+outputs/

@@ -1,5 +1,5 @@
 """
-Synthesize user-turn Hindi text → WAV + training manifest.
+Synthesize single-turn Hindi user text to FLAC + training manifest.
 
   # Single GPU
   python omni_speech/datasets/processing/text_to_audio.py
@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 
+import soundfile as sf
 import yaml
 from tqdm import tqdm
 
@@ -26,60 +27,55 @@ with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
     data_path = config["data"]["path"]
 
-JSON_PATH = os.path.join(data_path, "combined_dataset.json")
-OUT_DIR = os.path.join(data_path, "wavss")
-MANIFEST_PATH = os.path.join(data_path, "manifestss.json")
-MANIFEST_DIR = os.path.join(data_path, "manifestss_shardss")
+JSON_CANDIDATES = (
+    os.path.join(data_path, "combined_dataset.json"))
+OUT_DIR = os.path.join(data_path, "flac")
+MANIFEST_PATH = os.path.join(data_path, "manifest.json")
+MANIFEST_DIR = os.path.join(data_path, "manifest_shards")
 
 FIRST_TURN_PROMPT = "<speech>\nकृपया उपयोगकर्ता के भाषण में प्रश्नों का सीधे उत्तर दें।"
 
 
-def build_conversations(item: dict, wav_dir: str, tts: HindiTTSBridge, skip_existing: bool) -> list[dict]:
-    """Returns 1 entry for single-turn, 2 entries for multi-turn."""
+def get_json_path() -> str:
+    for path in JSON_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "Could not find dataset JSON. Checked: " + ", ".join(JSON_CANDIDATES)
+    )
+
+
+def save_flac(tts: HindiTTSBridge, text: str, path: str) -> None:
+    waveform = tts.synthesize(text)
+    sf.write(path, waveform, tts.sample_rate, format="FLAC")
+
+
+def build_conversations(item: dict, audio_dir: str, tts: HindiTTSBridge, skip_existing: bool) -> list[dict]:
+    """Return one speech entry only for one user/assistant turn."""
     item_id = item["id"]
     messages = item.get("messages", [])
-    if not messages:
+    if len(messages) != 2:
         return []
 
-    results = []
-
-    # --- Entry 1: Speech (always first user turn only) ---
-    first_user = next((m for m in messages if m.get("role") == "user"), None)
-    first_assistant = next((m for m in messages if m.get("role") == "assistant"), None)
-    if not first_user or not first_assistant:
+    first_user, first_assistant = messages
+    if first_user.get("role") != "user" or first_assistant.get("role") != "assistant":
         return []
 
     content = first_user["content"].strip()
-    wav_name = f"{item_id}-1_user.wav"
-    wav_path = os.path.join(wav_dir, wav_name)
+    audio_name = f"{item_id}-1_user.flac"
+    audio_path = os.path.join(audio_dir, audio_name)
 
-    if not (skip_existing and os.path.isfile(wav_path) and os.path.getsize(wav_path) > 0):
-        tts.save(tts.synthesize(content), wav_path)
+    if not (skip_existing and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0):
+        save_flac(tts, content, audio_path)
 
-    results.append({
+    return [{
         "id": f"{item_id}_speech",
-        "speech": wav_path,
+        "speech": audio_path,
         "conversations": [
             {"from": "human", "value": FIRST_TURN_PROMPT},
             {"from": "gpt", "value": first_assistant["content"].strip()},
         ],
-    })
-
-    # --- Entry 2: Text-only multi-turn (only if >1 turn) ---
-    num_user_turns = sum(1 for m in messages if m.get("role") == "user")
-    if num_user_turns > 1:
-        conversations = []
-        for msg in messages:
-            conversations.append({
-                "from": "human" if msg["role"] == "user" else "gpt",
-                "value": msg["content"].strip(),
-            })
-        results.append({
-            "id": f"{item_id}_text",
-            "conversations": conversations,
-        })
-
-    return results
+    }]
 
 def shard_indices(n: int, shard_id: int, num_shards: int) -> range:
     start = (n * shard_id) // num_shards
@@ -146,7 +142,9 @@ def main() -> None:
         merge_manifests(args.num_shards)
         return
 
-    with open(JSON_PATH, encoding="utf-8") as f:
+    json_path = get_json_path()
+    print(f"Using dataset JSON: {json_path}")
+    with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
     if args.max_samples:
         data = data[: args.max_samples]

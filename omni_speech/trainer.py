@@ -4,8 +4,11 @@ import os
 from typing import Dict, List
 
 import hydra
+import numpy as np
 import pytorch_lightning as pl
+import soundfile as sf
 import torch
+import torchaudio
 import whisper
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
@@ -23,6 +26,17 @@ from omni_speech.model.language_model.omni_speech_llama import (
     OmniSpeechConfig,
     OmniSpeechLlamaForCausalLM,
 )
+
+
+def _load_audio_16k(path: str, sample_rate: int = 16000) -> np.ndarray:
+    audio, file_sr = sf.read(path, dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=-1)
+    if file_sr != sample_rate:
+        waveform = torch.from_numpy(audio).unsqueeze(0)
+        waveform = torchaudio.functional.resample(waveform, file_sr, sample_rate)
+        audio = waveform.squeeze(0).numpy()
+    return audio.astype(np.float32)
 
 
 def _optional_abs_path(path):
@@ -61,7 +75,9 @@ class SpeechDataset(Dataset):
         self.mel_size = mel_size
 
         with open(self.data_path, "r") as f:
-            self.samples = json.load(f)
+            samples = json.load(f)
+
+        self.samples = self._filter_usable_samples(samples)
 
         self.data_args = DataArguments(
             is_multimodal=True,
@@ -72,6 +88,40 @@ class SpeechDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def _has_usable_audio(self, item):
+        speech_path = item.get("speech")
+        if not speech_path:
+            return False
+        speech_path = self._resolve_speech_path(speech_path)
+        return os.path.isfile(speech_path) and os.path.getsize(speech_path) > 0
+
+    def _filter_usable_samples(self, samples):
+        usable = []
+        skipped_missing_audio = 0
+        skipped_no_conversation = 0
+        skipped_multiturn = 0
+
+        for item in samples:
+            if "conversations" not in item:
+                skipped_no_conversation += 1
+                continue
+            if len(item["conversations"]) != 2:
+                skipped_multiturn += 1
+                continue
+            if not self._has_usable_audio(item):
+                skipped_missing_audio += 1
+                continue
+            usable.append(item)
+
+        print(
+            "Loaded "
+            f"{len(usable)} usable speech samples from {self.data_path} "
+            f"(skipped {skipped_missing_audio} missing/empty audio, "
+            f"{skipped_no_conversation} without conversations, "
+            f"{skipped_multiturn} multi-turn samples)."
+        )
+        return usable
+
     def _resolve_speech_path(self, speech_path):
         speech_path = os.path.expanduser(speech_path)
         if os.path.isabs(speech_path):
@@ -80,7 +130,7 @@ class SpeechDataset(Dataset):
         return os.path.join(root, speech_path)
 
     def _load_speech(self, speech_path):
-        speech = whisper.load_audio(self._resolve_speech_path(speech_path))
+        speech = _load_audio_16k(self._resolve_speech_path(speech_path))
         if self.input_type == "raw":
             speech = torch.from_numpy(speech)
             if getattr(self.model_config, "speech_normalize", False):
@@ -140,6 +190,7 @@ class SpeechCollator:
             "attention_mask": attention_mask,
             "speech": speech,
             "speech_lengths": speech_lengths,
+            
         }
 
 
@@ -212,7 +263,15 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         self.tokenizer, self.model = self._load_model_and_tokenizer()
         self.speech_dtype = _model_dtype(cfg.training.precision)
         self._freeze_speech_encoder()
+        self._freeze_llm_backbone()
         self._unfreeze_speech_projector()
+
+    def _freeze_llm_backbone(self):
+        for name, param in self.model.get_model().named_parameters():
+            if not name.startswith("speech_projector"):
+                param.requires_grad = False
+        for param in self.model.lm_head.parameters():
+            param.requires_grad = False
 
     def _load_model_and_tokenizer(self):
         config_path = to_absolute_path(str(self.cfg.model.config_path))
@@ -223,6 +282,7 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         config = OmniSpeechConfig.from_pretrained(config_path)
         config.tokenizer_model_max_length = self.cfg.model.model_max_length
         config.tokenizer_padding_side = "right"
+        config._attn_implementation = "eager"
 
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False)
         if tokenizer.pad_token is None:

@@ -1,6 +1,6 @@
 data:
   path: "/home/groups/ai/gupta/datasets/llama_hindi"
-  json_path: "${data.path}/manifestss.json"
+  json_path: "${data.path}/manifest.json"
   audio_root: null
   validation_split: 0.05
   seed: 42
