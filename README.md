@@ -2,7 +2,7 @@
 
 > A LLaMA-Omni inspired end-to-end speech language model fine-tuned for Hindi, capable of understanding spoken Hindi questions and responding in speech — in your own voice.
 
-![Model Architecture](images/model.png)
+![Model Architecture](images/models.png)
 
 ---
 
