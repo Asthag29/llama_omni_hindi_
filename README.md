@@ -49,7 +49,7 @@ No suitable Hindi spoken instruction-following dataset existed, so a custom one 
 - **Size**: ~110k samples
 
 The dataset is publicly available on Hugging Face:
-**[Pastaaaaa2003/hindi-llama-omni](https://huggingface.co/datasets/Pastaaaaa2003/hindi-spoken-instruct)**
+**[Pastaaaaa2003/hindi-llama-omni](https://huggingface.co/datasets/Pastaaaaa2003/Hindi-speech-instruct)**
 
 ---
 
