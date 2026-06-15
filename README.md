@@ -8,7 +8,7 @@
 
 ## Overview
 
-This project adapts the [LLaMA-Omni](https://github.com/ictnlp/LLaMA-Omni) architecture for the Hindi language. LLaMA-Omni is an end-to-end speech interaction model that enables simultaneous generation of text and speech responses from speech input, targeting low-latency voice assistants.
+This project adapts the [LLaMA-Omni](https://github.com/ictnlp/LLaMA-Omni) architecture for the Hindi language. LLaMA-Omni is an end-to-end speech interaction model that enables generation of text and speech responses from speech input, targeting voice assistants.
 
 ### Key differences from the original LLaMA-Omni
 
