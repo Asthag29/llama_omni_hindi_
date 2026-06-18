@@ -16,6 +16,10 @@ indic.py
 logs/
 outputs/
 train_slurm.sh
+train_backbone.sh
+run_wandb_backbone_sweep.sh
 uv.lock
 
 delete_folder/
+
+*.sh
