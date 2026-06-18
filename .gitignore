@@ -15,3 +15,7 @@ indic.py
 
 logs/
 outputs/
+train_slurm.sh
+uv.lock
+
+delete_folder/

@@ -89,7 +89,13 @@ class OmniSpeechMetaForCausalLM(ABC):
         speech_encoder_type = self.config.speech_encoder_type #* name of the model type like whisper, etc.
         speech_encoder = self.get_speech_encoder()
         if "whisper" in speech_encoder_type.lower():
-            encoder_outs = speech_encoder(speech.permute(0, 2, 1))
+            encoder_input = speech.permute(0, 2, 1)
+            encoder_trainable = any(p.requires_grad for p in speech_encoder.parameters())
+            if encoder_trainable:
+                encoder_outs = speech_encoder(encoder_input)
+            else:
+                with torch.no_grad():
+                    encoder_outs = speech_encoder(encoder_input)
             speech_lengths = (speech_lengths + 1) // 2 #* becuase whisper encoder half the time dimension 
         else:
             raise ValueError(f'Unknown speech encoder: {speech_encoder}')

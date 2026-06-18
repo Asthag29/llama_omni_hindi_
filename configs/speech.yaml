@@ -1,0 +1,66 @@
+data:
+  path: "data"
+  json_path: "${data.path}/dataset.json"
+  audio_root: "${data.path}/flac"
+  validation_split: 0.05
+  seed: 42
+  input_type: "mel"
+  mel_size: 128
+  num_workers: 4
+  
+model:
+  name: "llama"
+  path: "models/llama"
+  config_path: "models/llama"
+  model_base: "models/llama"
+  tokenizer_path: "models/llama"
+  model_max_length: 2048
+
+training:
+  num_train_epochs: 2
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 1e-4
+  tune_speech_projector: false
+  tune_llm_backbone: true
+  tune_speech_encoder: false
+  use_lora: true
+  lora_r: 64
+  lora_alpha: 64  # scaling factor = r/alpha
+  lora_dropout: 0.05
+  gradient_checkpointing: true
+  use_8bit_optimizer: false
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.2
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  precision: "bf16-mixed"
+  accelerator: "auto"
+  devices: "auto"
+  strategy: "auto"
+  log_every_n_steps: 10
+  val_check_interval: 1.0
+  fast_dev_run: false
+  attn_implementation: "sdpa"
+
+logging:
+  output_dir: "outputs/training_lora"
+  log_file: "logs/train.log"
+  csv: true
+  csv_metrics_file: "csv/metrics.csv"
+  tensorboard: false
+  wandb: true
+  wandb_project: "llama-omni-training"
+  wandb_run_name: lora-training-1/4
+  checkpoint_monitor: "val_loss"
+  checkpoint_format: "safetensors"  # safetensors | lightning
+  save_top_k: 1
+  save_last: true
+  save_weights_only: true  # only used when checkpoint_format=lightning
+
+hydra:
+  run:
+    dir: ${logging.output_dir}/hydra/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ${logging.output_dir}/hydra_sweeps
+    subdir: ${hydra.job.num}

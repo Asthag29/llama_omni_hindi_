@@ -1,0 +1,34 @@
+2026-06-17 18:16:13 INFO Reached EOF.
+2026-06-17 18:16:13 INFO Closing mailbox, abandoning 0 handles.
+2026-06-17 18:16:26 INFO Running runs: []
+2026-06-17 18:16:29 INFO Agent received command: run
+2026-06-17 18:16:29 INFO Agent starting run with config:
+	logging.output_dir: outputs/backbone_lora_sweep
+	logging.wandb_project: llama-omni-backbone-training
+	training.learning_rate: 0.00010738696582151756
+	training.lora_alpha: 32
+	training.lora_dropout: 0.1
+	training.lora_r: 64
+2026-06-17 18:16:29 INFO About to run command: /usr/bin/env bash train_backbone.sh logging.output_dir=outputs/backbone_lora_sweep logging.wandb_project=llama-omni-backbone-training training.learning_rate=0.00010738696582151756 training.lora_alpha=32 training.lora_dropout=0.1 training.lora_r=64
+2026-06-17 18:16:34 INFO Running runs: ['783f0rr2']
+2026-06-17 18:31:48 INFO Reached EOF.
+2026-06-17 18:31:48 INFO Closing mailbox, abandoning 0 handles.
+2026-06-17 18:47:27 INFO Reached EOF.
+2026-06-17 18:47:27 INFO Closing mailbox, abandoning 0 handles.
+2026-06-17 18:47:40 INFO Running runs: []
+2026-06-17 18:47:40 INFO Agent received command: run
+2026-06-17 18:47:40 INFO Agent starting run with config:
+	logging.output_dir: outputs/backbone_lora_sweep
+	logging.wandb_project: llama-omni-backbone-training
+	sweep.decision_start_step: 200
+	sweep.enabled: True
+	sweep.eval_interval_steps: 200
+	sweep.min_val_improvement: 0.01
+	sweep.patience_evals: 1
+	training.learning_rate: 6.349310622281942e-05
+	training.lora_alpha: 32
+	training.lora_dropout: 0
+	training.lora_r: 32
+	training.num_train_epochs: 1
+2026-06-17 18:47:40 INFO About to run command: /usr/bin/env bash train_backbone.sh logging.output_dir=outputs/backbone_lora_sweep logging.wandb_project=llama-omni-backbone-training sweep.decision_start_step=200 sweep.enabled=True sweep.eval_interval_steps=200 sweep.min_val_improvement=0.01 sweep.patience_evals=1 training.learning_rate=6.349310622281942e-05 training.lora_alpha=32 training.lora_dropout=0 training.lora_r=32 training.num_train_epochs=1
+2026-06-17 18:47:45 INFO Running runs: ['rlab9guv']

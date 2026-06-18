@@ -224,5 +224,3 @@ conv_templates = {
 }
 
 
-if __name__ == "__main__":
-    print(default_conversation.default_conversation())
