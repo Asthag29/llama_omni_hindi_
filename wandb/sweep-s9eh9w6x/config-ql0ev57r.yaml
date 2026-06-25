@@ -1,0 +1,20 @@
+wandb_version: 1
+
+data.train_fraction:
+  value: 0.2
+data.val_fraction:
+  value: 0.2
+logging.output_dir:
+  value: outputs/backbone_lora_sweep
+logging.wandb_project:
+  value: hindi_llama_omni
+training.learning_rate:
+  value: 7.484075777508009e-05
+training.lora_alpha:
+  value: 128
+training.lora_r:
+  value: 64
+training.num_train_epochs:
+  value: 1
+training.val_check_interval:
+  value: 1600

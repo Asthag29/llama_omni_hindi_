@@ -9,10 +9,9 @@ import pytorch_lightning as pl
 import torch
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.callbacks import Callback
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset, Sampler, random_split
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset, random_split
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from omni_speech.constants import IGNORE_INDEX
@@ -156,9 +155,7 @@ class TextLengthBucketSampler(Sampler):
 
         lengths = []
         for i in range(len(dataset)):
-            idx = dataset.indices[i] if hasattr(dataset, "indices") else i
-            base_dataset = dataset.dataset if hasattr(dataset, "dataset") else dataset
-            item = base_dataset.samples[idx]
+            item = self._sample_metadata(dataset, i)
             text_len = sum(len(turn.get("value", "")) for turn in item.get("conversations", []))
             lengths.append((i, text_len))
 
@@ -183,6 +180,13 @@ class TextLengthBucketSampler(Sampler):
     def __len__(self):
         return sum(len(bucket) for bucket in self.buckets)
 
+    @staticmethod
+    def _sample_metadata(dataset, index: int) -> Dict:
+        while isinstance(dataset, Subset):
+            index = int(dataset.indices[index])
+            dataset = dataset.dataset
+        return dataset.samples[index]
+
 
 class TextDataModule(pl.LightningDataModule):
     def __init__(self, cfg: DictConfig, tokenizer, model_config):
@@ -192,6 +196,18 @@ class TextDataModule(pl.LightningDataModule):
         self.model_config = model_config
         self.train_dataset = None
         self.val_dataset = None
+
+    def _fraction_subset(self, dataset, fraction: float, seed_offset: int, name: str):
+        if fraction >= 1.0:
+            return dataset
+        if fraction <= 0.0:
+            raise ValueError(f"data.{name}_fraction must be in (0, 1], got {fraction}")
+
+        subset_size = max(1, int(round(len(dataset) * fraction)))
+        generator = torch.Generator().manual_seed(int(self.cfg.data.seed) + seed_offset)
+        indices = torch.randperm(len(dataset), generator=generator)[:subset_size].tolist()
+        print(f"Using {subset_size}/{len(dataset)} {name} samples ({fraction:.0%}).")
+        return Subset(dataset, indices)
 
     def setup(self, stage=None):
         if self.train_dataset is not None:
@@ -205,7 +221,12 @@ class TextDataModule(pl.LightningDataModule):
 
         val_split = float(self.cfg.data.validation_split)
         if len(dataset) < 2 or val_split <= 0:
-            self.train_dataset = dataset
+            self.train_dataset = self._fraction_subset(
+                dataset,
+                float(self.cfg.data.get("train_fraction", 1.0)),
+                101,
+                "train",
+            )
             self.val_dataset = None
             return
 
@@ -213,10 +234,22 @@ class TextDataModule(pl.LightningDataModule):
         val_size = max(1, min(len(dataset) - 1, val_size))
         train_size = len(dataset) - val_size
         generator = torch.Generator().manual_seed(int(self.cfg.data.seed))
-        self.train_dataset, self.val_dataset = random_split(
+        train_dataset, val_dataset = random_split(
             dataset,
             [train_size, val_size],
             generator=generator,
+        )
+        self.train_dataset = self._fraction_subset(
+            train_dataset,
+            float(self.cfg.data.get("train_fraction", 1.0)),
+            101,
+            "train",
+        )
+        self.val_dataset = self._fraction_subset(
+            val_dataset,
+            float(self.cfg.data.get("val_fraction", 1.0)),
+            202,
+            "val",
         )
 
     def train_dataloader(self):
@@ -426,6 +459,25 @@ class BackboneTrainingModule(pl.LightningModule):
         )
         return loss
 
+    def on_before_optimizer_step(self, optimizer):
+        grad_norms = [
+            param.grad.detach().float().norm(2)
+            for param in self.parameters()
+            if param.requires_grad and param.grad is not None
+        ]
+        if not grad_norms:
+            return
+
+        global_grad_norm = torch.stack(grad_norms).norm(2)
+        self.log(
+            "grad_norm_global",
+            global_grad_norm,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+        )
+
     def configure_optimizers(self):
         trainable_params = [param for param in self.parameters() if param.requires_grad]
         use_8bit = bool(self.cfg.training.get("use_8bit_optimizer", False))
@@ -464,85 +516,6 @@ class BackboneTrainingModule(pl.LightningModule):
             },
         }
 
-
-class SweepEarlyTerminateCallback(Callback):
-    """Stop sweep trials early when validation loss fails to improve."""
-
-    def __init__(
-        self,
-        enabled: bool = False,
-        decision_start_step: int = 200,
-        min_val_improvement: float = 0.01,
-        patience_evals: int = 1,
-    ):
-        self.enabled = bool(enabled)
-        self.decision_start_step = int(decision_start_step)
-        self.min_val_improvement = float(min_val_improvement)
-        self.patience_evals = int(patience_evals)
-        self.best_val_loss: Optional[float] = None
-        self.bad_eval_count = 0
-        self.decision_complete = False
-
-    @staticmethod
-    def _metric(trainer, key: str) -> Optional[float]:
-        if key not in trainer.callback_metrics:
-            return None
-        value = trainer.callback_metrics[key]
-        return float(value.detach().cpu()) if isinstance(value, torch.Tensor) else float(value)
-
-    def on_validation_epoch_end(self, trainer, pl_module) -> None:
-        if not self.enabled:
-            return
-        if self.decision_complete:
-            return
-
-        current_step = int(trainer.global_step)
-        if current_step < self.decision_start_step:
-            return
-
-        val_loss = self._metric(trainer, "val_loss")
-        if val_loss is None:
-            return
-
-        if self.best_val_loss is None:
-            self.best_val_loss = val_loss
-            self.baseline_recorded = True
-            if trainer.global_rank == 0:
-                print(
-                    "[sweep-early-stop] Baseline val_loss "
-                    f"{val_loss:.6f} recorded at global_step={current_step}."
-                )
-            return
-
-        improvement = self.best_val_loss - val_loss
-        if improvement >= self.min_val_improvement:
-            self.best_val_loss = val_loss
-            self.bad_eval_count = 0
-            self.decision_complete = True
-            if trainer.global_rank == 0:
-                print(
-                    "[sweep-early-stop] val_loss improved by "
-                    f"{improvement:.6f} at global_step={current_step}; keeping this trial."
-                )
-            return
-
-        self.bad_eval_count += 1
-        if trainer.global_rank == 0:
-            print(
-                "[sweep-early-stop] val_loss did not improve enough "
-                f"(best={self.best_val_loss:.6f}, current={val_loss:.6f}, "
-                f"required={self.min_val_improvement:.6f}, bad_eval_count={self.bad_eval_count})."
-            )
-
-        if self.bad_eval_count >= self.patience_evals:
-            if trainer.global_rank == 0:
-                print(
-                    "[sweep-early-stop] Stopping trial early at "
-                    f"global_step={current_step} due to insufficient val_loss improvement."
-                )
-            trainer.should_stop = True
-
-
 @hydra.main(version_base=None, config_path="../configs", config_name="backbone")
 def main(cfg: DictConfig):
     pl.seed_everything(int(cfg.data.seed), workers=True)
@@ -552,20 +525,7 @@ def main(cfg: DictConfig):
     data_module.setup()
     has_validation = data_module.val_dataset is not None
     callbacks = build_callbacks(cfg, has_validation)
-    callbacks.append(
-        SweepEarlyTerminateCallback(
-            enabled=bool(cfg.get("sweep", {}).get("enabled", False)),
-            decision_start_step=int(cfg.get("sweep", {}).get("decision_start_step", 200)),
-            min_val_improvement=float(cfg.get("sweep", {}).get("min_val_improvement", 0.01)),
-            patience_evals=int(cfg.get("sweep", {}).get("patience_evals", 1)),
-        )
-    )
     val_check_interval = cfg.training.val_check_interval
-    if bool(cfg.get("sweep", {}).get("enabled", False)):
-        eval_interval_steps = int(cfg.get("sweep", {}).get("eval_interval_steps", 0))
-        if eval_interval_steps > 0:
-            grad_accum = int(cfg.training.gradient_accumulation_steps)
-            val_check_interval = max(1, eval_interval_steps * grad_accum)
 
     trainer = pl.Trainer(
         default_root_dir=to_absolute_path(str(cfg.logging.output_dir)),

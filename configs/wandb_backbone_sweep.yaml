@@ -1,4 +1,5 @@
 program: train_backbone.sh
+project: hindi_llama_omni
 method: bayes
 
 metric:
@@ -12,45 +13,37 @@ command:
   - ${args_no_hyphens}
 
 parameters:
+  data.train_fraction:
+    value: 0.2
+
+  data.val_fraction:
+    value: 0.2
+
   training.lora_r:
     values: [16, 32, 64, 128]
 
   training.lora_alpha:
     values: [16, 32, 64, 128]
 
-  training.lora_dropout:
-    values: [0.0, 0.03, 0.05, 0.1]
-
   training.learning_rate:
     distribution: log_uniform_values
     min: 1e-6
-    max: 5e-3
+    max: 1e-3
 
   training.num_train_epochs:
     value: 1
 
-  sweep.enabled:
-    value: true
-
-  sweep.decision_start_step:
-    value: 200
-
-  sweep.eval_interval_steps:
-    value: 200
-
-  sweep.min_val_improvement:
-    value: 0.01
-
-  sweep.patience_evals:
-    value: 1
+  training.val_check_interval:
+    value: 1600
 
   logging.wandb_project:
-    value: llama-omni-backbone-training
+    value: hindi_llama_omni
 
   logging.output_dir:
     value: outputs/backbone_lora_sweep
 
 early_terminate:
   type: hyperband
-  min_iter: 600
+  min_iter: 150
   eta: 3
+  max_iter: 1200

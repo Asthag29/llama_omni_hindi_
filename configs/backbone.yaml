@@ -2,6 +2,8 @@ data:
   path: "data/instruct"
   json_path: "${data.path}/hindi_instruct_conversations.json"
   validation_split: 0.05
+  train_fraction: 1.0
+  val_fraction: 1.0
   seed: 42
   num_workers: 4
 
@@ -14,21 +16,21 @@ model:
   model_max_length: 2048
 
 training:
-  num_train_epochs: 2
-  batch_size: 2
-  gradient_accumulation_steps: 8  #forward and backward are accumulated over this steps and then the gradients are updated(sum of 8 microbatch)
-  learning_rate: 1e-4
+  num_train_epochs: 3
+  batch_size: 3 #!keep this
+  gradient_accumulation_steps: 7  #forward and backward are accumulated over this steps and then the gradients are updated(sum of 8 microbatch)
+  learning_rate: 0.000107467137359001
   tune_speech_projector: false
   tune_llm_backbone: true
   tune_speech_encoder: false
   use_lora: true
-  lora_r: 64
-  lora_alpha: 64
+  lora_r: 128  #128
+  lora_alpha: 64  #64
   lora_dropout: 0.05
   gradient_checkpointing: true
   use_8bit_optimizer: false
   lr_scheduler_type: "cosine"
-  warmup_ratio: 0.01
+  warmup_ratio: 0.03
   weight_decay: 0.0
   max_grad_norm: 1.0   #clipping the gradients to prevent exploding gradients
   precision: "bf16-mixed"
@@ -47,16 +49,13 @@ logging:
   csv_metrics_file: "csv/metrics.csv"
   tensorboard: false
   wandb: true
-  wandb_project: "llama-omni-backbone-training"
+  wandb_project: "hindi_llama_omni"
   wandb_run_name: "hindi-backbone-lora"
   checkpoint_monitor: "val_loss"
   checkpoint_format: "safetensors"
   save_top_k: 1
   save_last: true
   save_weights_only: true
-
-sweep:
-  enabled: false
 
 hydra:
   run:

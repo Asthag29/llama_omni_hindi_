@@ -456,6 +456,16 @@ class SafetensorsCheckpointCallback(Callback):
         if trainer.global_rank != 0:
             return
 
+        if not os.path.isdir(ckpt_dir):
+            logging.warning("Skipping checkpoint bookkeeping because %s was not created.", ckpt_dir)
+            return
+
+        if self.save_last:
+            last_dir = os.path.join(self.dirpath, "last")
+            if os.path.isdir(last_dir):
+                shutil.rmtree(last_dir)
+            shutil.copytree(ckpt_dir, last_dir)
+
         self.best_models[ckpt_dir] = metric
         if self.save_top_k > 0:
             ranked = sorted(self.best_models.items(), key=lambda x: x[1], reverse=self.mode != "min")
@@ -463,12 +473,6 @@ class SafetensorsCheckpointCallback(Callback):
                 self.best_models.pop(stale_dir, None)
                 if os.path.isdir(stale_dir):
                     shutil.rmtree(stale_dir)
-
-        if self.save_last:
-            last_dir = os.path.join(self.dirpath, "last")
-            if os.path.isdir(last_dir):
-                shutil.rmtree(last_dir)
-            shutil.copytree(ckpt_dir, last_dir)
 
     def on_validation_epoch_end(self, trainer, pl_module) -> None:
         self._on_epoch_end(trainer, pl_module)
