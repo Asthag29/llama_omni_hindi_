@@ -23,3 +23,23 @@ uv.lock
 delete_folder/
 
 *.sh
+.cache/
+.ipynb_checkpoints/
+.uv-cache/
+.venv/
+.venv*/
+data/
+delete_folder/
+llama_omni.egg-info/
+logs/
+models/
+outputs/
+wandb/
+*.sh
+*.sbatch
+uv.lock
+backbone.sbatch
+sweep.sbatch
+
+
+__pycache__/
