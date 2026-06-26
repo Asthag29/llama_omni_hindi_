@@ -1,7 +1,7 @@
 data:
   path: "data/instruct"
   json_path: "${data.path}/hindi_instruct_conversations.json"
-  validation_split: 0.05
+  validation_split: 0.1
   train_fraction: 1.0
   val_fraction: 1.0
   seed: 42
@@ -17,9 +17,9 @@ model:
 
 training:
   num_train_epochs: 3
-  batch_size: 3 #!keep this
+  batch_size: 2 #!keep this
   gradient_accumulation_steps: 7  #forward and backward are accumulated over this steps and then the gradients are updated(sum of 8 microbatch)
-  learning_rate: 0.000107467137359001
+  learning_rate: 0.00107467137359001
   tune_speech_projector: false
   tune_llm_backbone: true
   tune_speech_encoder: false
@@ -30,14 +30,14 @@ training:
   gradient_checkpointing: true
   use_8bit_optimizer: false
   lr_scheduler_type: "cosine"
-  warmup_ratio: 0.03
-  weight_decay: 0.0
+  warmup_ratio: 0.03  #9% of the first epoch 
+  weight_decay: 0.00
   max_grad_norm: 1.0   #clipping the gradients to prevent exploding gradients
   precision: "bf16-mixed"
   accelerator: "auto"
   devices: "auto"
   strategy: "auto"
-  log_every_n_steps: 10
+  log_every_n_steps: 20
   val_check_interval: 0.25
   fast_dev_run: false
   attn_implementation: "sdpa"

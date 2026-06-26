@@ -296,6 +296,7 @@ class BackboneTrainingModule(pl.LightningModule):
         self._configure_trainable_parameters()
         self._maybe_enable_gradient_checkpointing()
         self._promote_trainable_params_to_fp32()
+        self._accumulated_microbatch_losses = []
 
     def _get_inner_speech_model(self):
         model = self.model
@@ -435,6 +436,7 @@ class BackboneTrainingModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         outputs = self(batch)
         loss = outputs.loss
+        self._accumulated_microbatch_losses.append(loss.detach())
         self.log(
             "train_loss",
             loss,
@@ -460,15 +462,32 @@ class BackboneTrainingModule(pl.LightningModule):
         return loss
 
     def on_before_optimizer_step(self, optimizer):
-        grad_norms = [
-            param.grad.detach().float().norm(2)
+        if self._accumulated_microbatch_losses:
+            effective_batch_loss = torch.stack(self._accumulated_microbatch_losses).mean()
+            self.log(
+                "train_loss_accum",
+                effective_batch_loss,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                sync_dist=True,
+            )
+            self._accumulated_microbatch_losses.clear()
+
+        trainable_params = [
+            param
             for param in self.parameters()
             if param.requires_grad and param.grad is not None
         ]
+        grad_norms = [param.grad.detach().float().norm(2) for param in trainable_params]
         if not grad_norms:
             return
 
+        weight_norms = [param.detach().float().norm(2) for param in trainable_params]
+
         global_grad_norm = torch.stack(grad_norms).norm(2)
+        global_weight_norm = torch.stack(weight_norms).norm(2)
+        global_grad_weight_ratio = global_grad_norm / global_weight_norm.clamp_min(1e-12)
         self.log(
             "grad_norm_global",
             global_grad_norm,
@@ -477,6 +496,73 @@ class BackboneTrainingModule(pl.LightningModule):
             prog_bar=False,
             sync_dist=True,
         )
+        self.log(
+            "grad_weight_ratio_global",
+            global_grad_weight_ratio,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+        )
+
+        lora_a_norms = []
+        lora_a_weight_norms = []
+        lora_b_norms = []
+        lora_b_weight_norms = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad or param.grad is None:
+                continue
+
+            grad_norm = param.grad.detach().float().norm(2)
+            weight_norm = param.detach().float().norm(2)
+            if "lora_A" in name:
+                lora_a_norms.append(grad_norm)
+                lora_a_weight_norms.append(weight_norm)
+            elif "lora_B" in name:
+                lora_b_norms.append(grad_norm)
+                lora_b_weight_norms.append(weight_norm)
+
+        if lora_a_norms:
+            lora_a_grad_norm = torch.stack(lora_a_norms).norm(2)
+            lora_a_weight_norm = torch.stack(lora_a_weight_norms).norm(2)
+            lora_a_grad_weight_ratio = lora_a_grad_norm / lora_a_weight_norm.clamp_min(1e-12)
+            self.log(
+                "grad_norm_lora_A",
+                lora_a_grad_norm,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                sync_dist=True,
+            )
+            self.log(
+                "grad_weight_ratio_lora_A",
+                lora_a_grad_weight_ratio,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                sync_dist=True,
+            )
+
+        if lora_b_norms:
+            lora_b_grad_norm = torch.stack(lora_b_norms).norm(2)
+            lora_b_weight_norm = torch.stack(lora_b_weight_norms).norm(2)
+            lora_b_grad_weight_ratio = lora_b_grad_norm / lora_b_weight_norm.clamp_min(1e-12)
+            self.log(
+                "grad_norm_lora_B",
+                lora_b_grad_norm,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                sync_dist=True,
+            )
+            self.log(
+                "grad_weight_ratio_lora_B",
+                lora_b_grad_weight_ratio,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                sync_dist=True,
+            )
 
     def configure_optimizers(self):
         trainable_params = [param for param in self.parameters() if param.requires_grad]
