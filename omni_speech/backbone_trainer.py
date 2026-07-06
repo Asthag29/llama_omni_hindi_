@@ -1,12 +1,12 @@
 import copy
 import json
 import os
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import hydra
 import pytorch_lightning as pl
 import torch
-import whisper
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.utils.rnn import pad_sequence
@@ -15,132 +15,112 @@ from torch.utils.data import DataLoader, Dataset, Sampler, Subset, random_split
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from omni_speech.constants import IGNORE_INDEX
-from omni_speech.datasets.preprocess import preprocess, preprocess_multimodal
-from omni_speech.utils import (
-    build_callbacks,
-    build_loggers,
-    load_omni_speech_checkpoint,
-    load_audio_16k,
-    model_dtype,
-    optional_abs_path,
-    resolve_checkpoint_path,
-    resolve_training_state_path,
-    save_omni_speech_checkpoint,
-)
+from omni_speech.datasets.preprocess import preprocess
 from omni_speech.model.language_model.omni_speech_llama import (
     OmniSpeechConfig,
     OmniSpeechLlamaForCausalLM,
 )
+from omni_speech.utils import (
+    build_callbacks,
+    build_loggers,
+    model_dtype,
+    optional_abs_path,
+    save_omni_speech_checkpoint,
+)
 
-class SpeechDataset(Dataset):
-    """Dataset for speech conversation samples; batching is handled by the collator."""
 
-    def __init__(
-        self,
-        data_path,
-        tokenizer,
-        model_config,
-        input_type="mel",
-        mel_size=128,
-        audio_root=None,
-    ):
+def load_json_array_maybe_prefixed(path: str) -> List[Dict]:
+    text = Path(path).read_text(encoding="utf-8")
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(f"Could not locate a JSON array in {path}")
+    return json.loads(text[start : end + 1])
+
+
+class TextConversationDataset(Dataset):
+    """Text-only dataset that normalizes either messages or conversations format."""
+
+    def __init__(self, data_path: str, tokenizer, model_config):
         self.data_path = optional_abs_path(data_path)
-        self.data_dir = os.path.dirname(self.data_path)
-        self.audio_root = optional_abs_path(audio_root)
         self.tokenizer = tokenizer
         self.model_config = model_config
-        self.input_type = input_type
-        self.mel_size = mel_size
 
-        with open(self.data_path, "r") as f:
-            samples = json.load(f)
-
-        # Read the flac directory once — just filenames, not file contents.
-        # This turns 2 filesystem calls per sample into 1 fast hash lookup.
-        root = self.audio_root or self.data_dir
-        self._existing_files = set(os.listdir(root)) if os.path.isdir(root) else set()
-
-        self.samples = self._filter_usable_samples(samples)
-
-        # Simple namespace matching what preprocess_multimodal expects,
-        # fed from the same Hydra config values passed to this class.
-        self.data_args = type("DataArgs", (), {
-            "is_multimodal": True,
-            "input_type": input_type,
-            "mel_size": mel_size,
-        })()
+        raw_samples = load_json_array_maybe_prefixed(self.data_path)
+        self.samples = self._normalize_samples(raw_samples)
 
     def __len__(self):
         return len(self.samples)
 
-    def _has_usable_audio(self, item):
-        speech_path = item.get("speech")
-        if not speech_path:
-            return False
-        filename = os.path.basename(speech_path)
-        return filename in self._existing_files
+    @staticmethod
+    def _normalize_turns(turns: List[Dict]) -> Optional[List[Dict]]:
+        normalized = []
+        for turn in turns:
+            if "from" in turn and "value" in turn:
+                role = turn["from"]
+                value = str(turn["value"]).strip()
+            elif "role" in turn and "content" in turn:
+                role = {"user": "human", "assistant": "gpt"}.get(turn["role"])
+                value = str(turn["content"]).strip()
+            else:
+                return None
 
-    def _filter_usable_samples(self, samples): #* if conversation is not in the item, skip it
+            if role not in {"human", "gpt"} or not value:
+                return None
+
+            normalized.append({"from": role, "value": value})
+
+        if not normalized or normalized[0]["from"] != "human":
+            return None
+
+        assistant_idx = next(
+            (idx for idx, turn in enumerate(normalized[1:], start=1) if turn["from"] == "gpt"),
+            None,
+        )
+        if assistant_idx is None:
+            return None
+
+        return [normalized[0], normalized[assistant_idx]]
+
+    def _normalize_samples(self, samples: List[Dict]) -> List[Dict]:
         usable = []
-        skipped_missing_audio = 0
-        skipped_no_conversation = 0
+        skipped_bad_format = 0
 
-        for item in samples:
-            if "conversations" not in item:
-                skipped_no_conversation += 1
+        for idx, item in enumerate(samples):
+            turns = None
+            if "conversations" in item:
+                turns = self._normalize_turns(item["conversations"])
+            elif "messages" in item:
+                turns = self._normalize_turns(item["messages"])
+
+            if turns is None:
+                skipped_bad_format += 1
                 continue
-            if not self._has_usable_audio(item):
-                skipped_missing_audio += 1
-                continue
-            usable.append(item)
+
+            usable.append(
+                {
+                    "id": item.get("id", f"sample-{idx}"),
+                    "conversations": turns,
+                }
+            )
 
         print(
-            "Loaded "
-            f"{len(usable)} usable speech samples from {self.data_path} "
-            f"(skipped {skipped_missing_audio} missing/empty audio, "
-            f"{skipped_no_conversation} without conversations)."
+            f"Loaded {len(usable)} text-only samples from {self.data_path} "
+            f"(skipped {skipped_bad_format} malformed samples)."
         )
         return usable
-
-    def _resolve_speech_path(self, speech_path):
-        speech_path = os.path.expanduser(speech_path)
-        if os.path.isabs(speech_path):
-            return speech_path
-        root = self.audio_root or self.data_dir
-        return os.path.join(root, speech_path)
-
-    #* volume normalization
-    def _load_speech(self, speech_path):
-        speech = load_audio_16k(self._resolve_speech_path(speech_path))
-        if self.input_type == "raw":
-            speech = torch.from_numpy(speech)
-            if getattr(self.model_config, "speech_normalize", False):
-                speech = torch.nn.functional.layer_norm(speech, speech.shape)
-            return speech, speech.shape[0]
-
-        if self.input_type != "mel":
-            raise ValueError(f"Unsupported input_type: {self.input_type}")
-
-        speech = whisper.pad_or_trim(speech)
-        speech = whisper.log_mel_spectrogram(speech, n_mels=self.mel_size).permute(1, 0)
-        return speech, speech.shape[0]
 
     def __getitem__(self, index):
         item = self.samples[index]
         source = copy.deepcopy(item["conversations"])
-        source = preprocess_multimodal([source], self.data_args)[0]
-        text = preprocess([source], self.tokenizer, has_speech=True)
-        speech, speech_length = self._load_speech(item["speech"])
-
+        text = preprocess([source], self.tokenizer, has_speech=False)
         return {
             "input_ids": text["input_ids"].squeeze(0),
             "labels": text["labels"].squeeze(0),
-            "speech": speech,
-            "speech_length": torch.tensor(speech_length, dtype=torch.long),
         }
 
 
-class SpeechCollator:
+class TextCollator:
     def __init__(self, tokenizer):
         self.pad_token_id = tokenizer.pad_token_id
         if self.pad_token_id is None:
@@ -148,7 +128,7 @@ class SpeechCollator:
 
     def __call__(self, instances: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         input_ids = pad_sequence(
-            [instance["input_ids"] for instance in instances], #instance is one sample from the dataset
+            [instance["input_ids"] for instance in instances],
             batch_first=True,
             padding_value=self.pad_token_id,
         )
@@ -158,30 +138,16 @@ class SpeechCollator:
             padding_value=IGNORE_INDEX,
         )
         attention_mask = input_ids.ne(self.pad_token_id)
-        speech = pad_sequence(
-            [instance["speech"] for instance in instances],
-            batch_first=True,
-            padding_value=0,
-        )
-        speech_lengths = torch.stack([instance["speech_length"] for instance in instances])
 
         return {
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": attention_mask,
-            "speech": speech,
-            "speech_lengths": speech_lengths,
-            
         }
 
 
-class LengthBucketSampler(Sampler):
-    """Groups samples of similar text length into batches to minimize padding waste.
-
-    Works with both raw Dataset and Subset (from random_split).
-    Shuffles *between* buckets each epoch so training order varies,
-    but samples *within* a batch have similar lengths.
-    """
+class TextLengthBucketSampler(Sampler):
+    """Bucket samples of similar text lengths to reduce padding waste."""
 
     def __init__(self, dataset, batch_size: int, bucket_size_multiplier: int = 10):
         self.batch_size = batch_size
@@ -189,15 +155,12 @@ class LengthBucketSampler(Sampler):
 
         lengths = []
         for i in range(len(dataset)):
-            idx = dataset.indices[i] if hasattr(dataset, "indices") else i
-            base_dataset = dataset.dataset if hasattr(dataset, "dataset") else dataset
-            item = base_dataset.samples[idx]
+            item = self._sample_metadata(dataset, i)
             text_len = sum(len(turn.get("value", "")) for turn in item.get("conversations", []))
             lengths.append((i, text_len))
 
         lengths.sort(key=lambda x: x[1])
 
-        # Group sorted indices into buckets, then shuffle buckets each epoch.
         bucket_size = batch_size * bucket_size_multiplier
         self.buckets = []
         for start in range(0, len(lengths), bucket_size):
@@ -206,6 +169,7 @@ class LengthBucketSampler(Sampler):
 
     def __iter__(self):
         import random
+
         bucket_order = list(range(len(self.buckets)))
         random.shuffle(bucket_order)
         for bi in bucket_order:
@@ -214,10 +178,17 @@ class LengthBucketSampler(Sampler):
             yield from bucket
 
     def __len__(self):
-        return sum(len(b) for b in self.buckets)
+        return sum(len(bucket) for bucket in self.buckets)
+
+    @staticmethod
+    def _sample_metadata(dataset, index: int) -> Dict:
+        while isinstance(dataset, Subset):
+            index = int(dataset.indices[index])
+            dataset = dataset.dataset
+        return dataset.samples[index]
 
 
-class SpeechDataModule(pl.LightningDataModule):
+class TextDataModule(pl.LightningDataModule):
     def __init__(self, cfg: DictConfig, tokenizer, model_config):
         super().__init__()
         self.cfg = cfg
@@ -225,10 +196,9 @@ class SpeechDataModule(pl.LightningDataModule):
         self.model_config = model_config
         self.train_dataset = None
         self.val_dataset = None
-        self.test_dataset = None
 
     def _fraction_subset(self, dataset, fraction: float, seed_offset: int, name: str):
-        if dataset is None or fraction >= 1.0:
+        if fraction >= 1.0:
             return dataset
         if fraction <= 0.0:
             raise ValueError(f"data.{name}_fraction must be in (0, 1], got {fraction}")
@@ -239,34 +209,18 @@ class SpeechDataModule(pl.LightningDataModule):
         print(f"Using {subset_size}/{len(dataset)} {name} samples ({fraction:.0%}).")
         return Subset(dataset, indices)
 
-    @staticmethod
-    def _bounded_split_size(dataset_size: int, fraction: float, min_size: int, max_size: int) -> int:
-        if dataset_size <= 0 or fraction <= 0.0 or max_size <= 0:
-            return 0
-        size = int(round(dataset_size * fraction))
-        return max(min_size, min(max_size, size))
-
-    def setup(self, stage=None):   #!need to understand this
+    def setup(self, stage=None):
         if self.train_dataset is not None:
             return
 
-        dataset = SpeechDataset(
+        dataset = TextConversationDataset(
             self.cfg.data.json_path,
             self.tokenizer,
             self.model_config,
-            input_type=self.cfg.data.input_type,
-            mel_size=self.cfg.data.mel_size,
-            audio_root=self.cfg.data.get("audio_root"),
         )
 
         val_split = float(self.cfg.data.validation_split)
-        test_split = float(self.cfg.data.get("test_split", 0.0))
-        if val_split < 0 or test_split < 0:
-            raise ValueError("data.validation_split and data.test_split must be non-negative.")
-        if val_split + test_split >= 1.0:
-            raise ValueError("data.validation_split + data.test_split must be < 1.0.")
-
-        if len(dataset) < 2 or (val_split <= 0 and test_split <= 0):
+        if len(dataset) < 2 or val_split <= 0:
             self.train_dataset = self._fraction_subset(
                 dataset,
                 float(self.cfg.data.get("train_fraction", 1.0)),
@@ -274,70 +228,40 @@ class SpeechDataModule(pl.LightningDataModule):
                 "train",
             )
             self.val_dataset = None
-            self.test_dataset = None
             return
 
-        dataset_size = len(dataset)
-        test_size = self._bounded_split_size(
-            dataset_size,
-            test_split,
-            min_size=1 if test_split > 0 else 0,
-            max_size=max(0, dataset_size - 1),
+        val_size = int(round(len(dataset) * val_split))
+        val_size = max(1, min(len(dataset) - 1, val_size))
+        train_size = len(dataset) - val_size
+        generator = torch.Generator().manual_seed(int(self.cfg.data.seed))
+        train_dataset, val_dataset = random_split(
+            dataset,
+            [train_size, val_size],
+            generator=generator,
         )
-        remaining_after_test = dataset_size - test_size
-        val_size = self._bounded_split_size(
-            dataset_size,
-            val_split,
-            min_size=1 if val_split > 0 else 0,
-            max_size=max(0, remaining_after_test - 1),
-        )
-        train_size = dataset_size - val_size - test_size
-
-        generator = torch.Generator().manual_seed(int(self.cfg.data.seed))  #manual_seed is used to ensure that the random split is reproducible
-        splits = [train_size]
-        if val_size > 0:
-            splits.append(val_size)
-        if test_size > 0:
-            splits.append(test_size)
-        subsets = random_split(dataset, splits, generator=generator)
-
         self.train_dataset = self._fraction_subset(
-            subsets[0],
+            train_dataset,
             float(self.cfg.data.get("train_fraction", 1.0)),
             101,
             "train",
         )
-        next_idx = 1
-        if val_size > 0:
-            self.val_dataset = self._fraction_subset(
-                subsets[next_idx],
-                float(self.cfg.data.get("val_fraction", 1.0)),
-                202,
-                "val",
-            )
-            next_idx += 1
-        else:
-            self.val_dataset = None
-        if test_size > 0:
-            self.test_dataset = self._fraction_subset(
-                subsets[next_idx],
-                float(self.cfg.data.get("test_fraction", 1.0)),
-                303,
-                "test",
-            )
-        else:
-            self.test_dataset = None
+        self.val_dataset = self._fraction_subset(
+            val_dataset,
+            float(self.cfg.data.get("val_fraction", 1.0)),
+            202,
+            "val",
+        )
 
     def train_dataloader(self):
-        batch_size = self.cfg.training.batch_size
+        batch_size = int(self.cfg.training.batch_size)
         if batch_size > 1:
-            sampler = LengthBucketSampler(self.train_dataset, batch_size)
+            sampler = TextLengthBucketSampler(self.train_dataset, batch_size)
             return DataLoader(
                 self.train_dataset,
                 batch_size=batch_size,
                 sampler=sampler,
                 num_workers=self.cfg.data.num_workers,
-                collate_fn=SpeechCollator(self.tokenizer),
+                collate_fn=TextCollator(self.tokenizer),
                 pin_memory=torch.cuda.is_available(),
             )
         return DataLoader(
@@ -345,7 +269,7 @@ class SpeechDataModule(pl.LightningDataModule):
             batch_size=batch_size,
             shuffle=True,
             num_workers=self.cfg.data.num_workers,
-            collate_fn=SpeechCollator(self.tokenizer),
+            collate_fn=TextCollator(self.tokenizer),
             pin_memory=torch.cuda.is_available(),
         )
 
@@ -357,44 +281,30 @@ class SpeechDataModule(pl.LightningDataModule):
             batch_size=self.cfg.training.batch_size,
             shuffle=False,
             num_workers=self.cfg.data.num_workers,
-            collate_fn=SpeechCollator(self.tokenizer),
-            pin_memory=torch.cuda.is_available(),
-        )
-
-    def test_dataloader(self):
-        if self.test_dataset is None:
-            return None
-        return DataLoader(
-            self.test_dataset,
-            batch_size=self.cfg.training.batch_size,
-            shuffle=False,
-            num_workers=self.cfg.data.num_workers,
-            collate_fn=SpeechCollator(self.tokenizer),
+            collate_fn=TextCollator(self.tokenizer),
             pin_memory=torch.cuda.is_available(),
         )
 
 
-class OmniSpeechTrainingModule(pl.LightningModule):
+class BackboneTrainingModule(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))
         self.tokenizer, self.model = self._load_model_and_tokenizer()
-        self.speech_dtype = model_dtype(cfg.training.precision)
         self._maybe_apply_lora()
-        self._maybe_load_init_checkpoint()
         self._configure_trainable_parameters()
         self._maybe_enable_gradient_checkpointing()
         self._promote_trainable_params_to_fp32()
         self._accumulated_microbatch_losses = []
 
-    def _get_inner_speech_model(self): #! need to check this for training with print statements
+    def _get_inner_speech_model(self):
         model = self.model
         if hasattr(model, "get_model"):
             return model.get_model()
         base = getattr(model, "base_model", None)
-        if base is not None and hasattr(base, "model"): #! after lora wrapper self.model is a peftobject which has a base_model attribute
-            inner = base.model  #! base.model is the actual model without the lora wrapper
+        if base is not None and hasattr(base, "model"):
+            inner = base.model
             if hasattr(inner, "get_model"):
                 return inner.get_model()
             return inner
@@ -409,8 +319,7 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         from peft import LoraConfig, get_peft_model
 
         lora_config = LoraConfig(
-
-            r=int(self.cfg.training.get("lora_r", 64)),  #! need to change this
+            r=int(self.cfg.training.get("lora_r", 64)),
             lora_alpha=int(self.cfg.training.get("lora_alpha", 64)),
             lora_dropout=float(self.cfg.training.get("lora_dropout", 0.05)),
             bias="none",
@@ -428,23 +337,15 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         self.model = get_peft_model(self.model, lora_config)
         self.model.print_trainable_parameters()
 
-    def _maybe_load_init_checkpoint(self):
-        init_path = self.cfg.model.get("init_checkpoint")
-        if not init_path:
-            return
-        checkpoint_path = resolve_checkpoint_path(optional_abs_path(init_path))
-        print(f"Initializing speech trainer weights from {checkpoint_path}")
-        load_omni_speech_checkpoint(self, checkpoint_path, adapter_trainable=True)
-
     def _configure_trainable_parameters(self):
-        tune_projector = bool(self.cfg.training.get("tune_speech_projector", True))
+        tune_projector = bool(self.cfg.training.get("tune_speech_projector", False))
         tune_llm = bool(self.cfg.training.get("tune_llm_backbone", False))
         tune_encoder = bool(self.cfg.training.get("tune_speech_encoder", False))
         use_lora = bool(self.cfg.training.get("use_lora", False)) and tune_llm
 
-        if not use_lora: #no lora
+        if not use_lora:
             for param in self.model.parameters():
-                param.requires_grad = False  #frozen
+                param.requires_grad = False
 
         inner_model = self._get_inner_speech_model()
         if tune_llm and not use_lora:
@@ -455,20 +356,18 @@ class OmniSpeechTrainingModule(pl.LightningModule):
             for param in self.model.lm_head.parameters():
                 param.requires_grad = True
 
-        if tune_projector and getattr(inner_model, "speech_projector", None) is not None:
+        if getattr(inner_model, "speech_projector", None) is not None:
             for param in inner_model.speech_projector.parameters():
-                param.requires_grad = True
+                param.requires_grad = tune_projector
 
         speech_encoder = inner_model.get_speech_encoder()
         if speech_encoder is not None:
             if tune_encoder:
                 speech_encoder.train()
-                for param in speech_encoder.parameters():
-                    param.requires_grad = True
             else:
                 speech_encoder.eval()
-                for param in speech_encoder.parameters():
-                    param.requires_grad = False
+            for param in speech_encoder.parameters():
+                param.requires_grad = tune_encoder
 
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.parameters())
@@ -480,9 +379,8 @@ class OmniSpeechTrainingModule(pl.LightningModule):
 
     def _load_model_and_tokenizer(self):
         config_path = to_absolute_path(str(self.cfg.model.config_path))
-        model_base = optional_abs_path(self.cfg.model.get("model_base"))  #llama model path
+        model_base = optional_abs_path(self.cfg.model.get("model_base"))
         tokenizer_path = optional_abs_path(self.cfg.model.get("tokenizer_path"))
-        # tokenizer_path = tokenizer_path or model_base or config_path
 
         config = OmniSpeechConfig.from_pretrained(config_path)
         config.tokenizer_model_max_length = self.cfg.model.model_max_length
@@ -491,7 +389,7 @@ class OmniSpeechTrainingModule(pl.LightningModule):
             self.cfg.training.get("attn_implementation", "sdpa")
         )
 
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False) # tokenization type (fast = rust implementation/ slow = python implementation)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.model_max_length = self.cfg.model.model_max_length
@@ -500,12 +398,12 @@ class OmniSpeechTrainingModule(pl.LightningModule):
             model_base or config_path,
             config=config,
             torch_dtype=model_dtype(self.cfg.training.precision),
-            low_cpu_mem_usage=False,  #todo : can experiment with True for better performance
+            low_cpu_mem_usage=False,
         )
 
         return tokenizer, model
 
-    def _maybe_enable_gradient_checkpointing(self): #recomputes missing activations in the forward pass when needed
+    def _maybe_enable_gradient_checkpointing(self):
         enabled = bool(self.cfg.training.get("gradient_checkpointing", False))
         if not enabled:
             return
@@ -517,8 +415,6 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         print("Gradient checkpointing enabled.")
 
     def _promote_trainable_params_to_fp32(self):
-        # Only needed for small trainable subsets under fp16 AMP.
-        # Full LLM fine-tuning must stay in bf16/fp16 or it OOMs immediately.
         tune_llm = bool(self.cfg.training.get("tune_llm_backbone", False))
         precision = str(self.cfg.training.precision)
         if tune_llm or "bf16" in precision:
@@ -527,27 +423,13 @@ class OmniSpeechTrainingModule(pl.LightningModule):
             if param.requires_grad:
                 param.data = param.data.float()
 
-    def _keep_speech_encoder_eval(self):
-        if bool(self.cfg.training.get("tune_speech_encoder", False)):
-            return
-        speech_encoder = self._get_inner_speech_model().get_speech_encoder()
-        if speech_encoder is None:
-            return
-        speech_encoder.eval()
-
-    def on_train_epoch_start(self):
-        self._keep_speech_encoder_eval()
-
-    def on_validation_epoch_start(self):
-        self._keep_speech_encoder_eval()
-
     def forward(self, batch):
         return self.model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             labels=batch["labels"],
-            speech=batch["speech"].to(dtype=self.speech_dtype),
-            speech_lengths=batch["speech_lengths"],
+            speech=None,
+            speech_lengths=None,
             use_cache=False,
         )
 
@@ -579,29 +461,6 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         )
         return loss
 
-    def _log_param_group_stats(self, name: str, grad_norms: List[torch.Tensor], weight_norms: List[torch.Tensor]) -> None:
-        if not grad_norms:
-            return
-        grad_norm = torch.stack(grad_norms).norm(2)
-        weight_norm = torch.stack(weight_norms).norm(2)
-        grad_weight_ratio = grad_norm / weight_norm.clamp_min(1e-12)
-        self.log(
-            f"grad_norm_{name}",
-            grad_norm,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            f"grad_weight_ratio_{name}",
-            grad_weight_ratio,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-
     def on_before_optimizer_step(self, optimizer):
         if self._accumulated_microbatch_losses:
             effective_batch_loss = torch.stack(self._accumulated_microbatch_losses).mean()
@@ -620,19 +479,36 @@ class OmniSpeechTrainingModule(pl.LightningModule):
             for param in self.parameters()
             if param.requires_grad and param.grad is not None
         ]
-        if not trainable_params:
+        grad_norms = [param.grad.detach().float().norm(2) for param in trainable_params]
+        if not grad_norms:
             return
 
-        grad_norms = [param.grad.detach().float().norm(2) for param in trainable_params]
         weight_norms = [param.detach().float().norm(2) for param in trainable_params]
-        self._log_param_group_stats("global", grad_norms, weight_norms)
 
-        lora_a_grad_norms = []
+        global_grad_norm = torch.stack(grad_norms).norm(2)
+        global_weight_norm = torch.stack(weight_norms).norm(2)
+        global_grad_weight_ratio = global_grad_norm / global_weight_norm.clamp_min(1e-12)
+        self.log(
+            "grad_norm_global",
+            global_grad_norm,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+        )
+        self.log(
+            "grad_weight_ratio_global",
+            global_grad_weight_ratio,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+        )
+
+        lora_a_norms = []
         lora_a_weight_norms = []
-        lora_b_grad_norms = []
+        lora_b_norms = []
         lora_b_weight_norms = []
-        projector_grad_norms = []
-        projector_weight_norms = []
         for name, param in self.named_parameters():
             if not param.requires_grad or param.grad is None:
                 continue
@@ -640,18 +516,53 @@ class OmniSpeechTrainingModule(pl.LightningModule):
             grad_norm = param.grad.detach().float().norm(2)
             weight_norm = param.detach().float().norm(2)
             if "lora_A" in name:
-                lora_a_grad_norms.append(grad_norm)
+                lora_a_norms.append(grad_norm)
                 lora_a_weight_norms.append(weight_norm)
             elif "lora_B" in name:
-                lora_b_grad_norms.append(grad_norm)
+                lora_b_norms.append(grad_norm)
                 lora_b_weight_norms.append(weight_norm)
-            elif "speech_projector" in name:
-                projector_grad_norms.append(grad_norm)
-                projector_weight_norms.append(weight_norm)
 
-        self._log_param_group_stats("lora_A", lora_a_grad_norms, lora_a_weight_norms)
-        self._log_param_group_stats("lora_B", lora_b_grad_norms, lora_b_weight_norms)
-        self._log_param_group_stats("speech_projector", projector_grad_norms, projector_weight_norms)
+        if lora_a_norms:
+            lora_a_grad_norm = torch.stack(lora_a_norms).norm(2)
+            lora_a_weight_norm = torch.stack(lora_a_weight_norms).norm(2)
+            lora_a_grad_weight_ratio = lora_a_grad_norm / lora_a_weight_norm.clamp_min(1e-12)
+            self.log(
+                "grad_norm_lora_A",
+                lora_a_grad_norm,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                sync_dist=True,
+            )
+            self.log(
+                "grad_weight_ratio_lora_A",
+                lora_a_grad_weight_ratio,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                sync_dist=True,
+            )
+
+        if lora_b_norms:
+            lora_b_grad_norm = torch.stack(lora_b_norms).norm(2)
+            lora_b_weight_norm = torch.stack(lora_b_weight_norms).norm(2)
+            lora_b_grad_weight_ratio = lora_b_grad_norm / lora_b_weight_norm.clamp_min(1e-12)
+            self.log(
+                "grad_norm_lora_B",
+                lora_b_grad_norm,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                sync_dist=True,
+            )
+            self.log(
+                "grad_weight_ratio_lora_B",
+                lora_b_grad_weight_ratio,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                sync_dist=True,
+            )
 
     def configure_optimizers(self):
         trainable_params = [param for param in self.parameters() if param.requires_grad]
@@ -691,14 +602,16 @@ class OmniSpeechTrainingModule(pl.LightningModule):
             },
         }
 
-@hydra.main(version_base=None, config_path="../configs", config_name="speech")
+@hydra.main(version_base=None, config_path="../configs", config_name="backbone")
 def main(cfg: DictConfig):
     pl.seed_everything(int(cfg.data.seed), workers=True)
 
-    module = OmniSpeechTrainingModule(cfg)
-    data_module = SpeechDataModule(cfg, module.tokenizer, module.model.config)
+    module = BackboneTrainingModule(cfg)
+    data_module = TextDataModule(cfg, module.tokenizer, module.model.config)
     data_module.setup()
     has_validation = data_module.val_dataset is not None
+    callbacks = build_callbacks(cfg, has_validation)
+    val_check_interval = cfg.training.val_check_interval
 
     trainer = pl.Trainer(
         default_root_dir=to_absolute_path(str(cfg.logging.output_dir)),
@@ -710,21 +623,14 @@ def main(cfg: DictConfig):
         accumulate_grad_batches=cfg.training.gradient_accumulation_steps,
         gradient_clip_val=cfg.training.max_grad_norm,
         logger=build_loggers(cfg),
-        callbacks=build_callbacks(cfg, has_validation),
+        callbacks=callbacks,
         log_every_n_steps=cfg.training.log_every_n_steps,
-        val_check_interval=cfg.training.val_check_interval,
+        val_check_interval=val_check_interval,
         fast_dev_run=cfg.training.fast_dev_run,
         enable_checkpointing=False,
     )
 
-    resume_cfg = cfg.get("resume")
-    resume_path = resume_cfg.get("path") if resume_cfg is not None else None
-    ckpt_path = None
-    if resume_path:
-        ckpt_path = resolve_training_state_path(resume_path)
-        print(f"Resuming trainer state from {ckpt_path}")
-
-    trainer.fit(module, datamodule=data_module, ckpt_path=ckpt_path)
+    trainer.fit(module, datamodule=data_module)
     final_dir = to_absolute_path(os.path.join(cfg.logging.output_dir, "final_model"))
     save_omni_speech_checkpoint(module, final_dir, metadata={"final": True})
     if trainer.global_rank == 0:

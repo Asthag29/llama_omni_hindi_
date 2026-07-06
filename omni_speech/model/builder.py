@@ -1,3 +1,5 @@
+
+#! need to delete this file
 # Adopted from https://github.com/haotian-liu/LLaVA. We modify the code to support speech input. Below is the original copyright:
 #    Copyright 2023 Haotian Liu
 #

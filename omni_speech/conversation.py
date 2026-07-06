@@ -183,7 +183,8 @@ conv_vicuna_v1 = Conversation(
 )
 
 conv_llama_2 = Conversation(
-    system="You are a helpful language and speech assistant. " "You are able to understand the speech content that the user provides, " "and assist the user with a variety of tasks using natural language.",
+    system="आप एक सहायक भाषा और वाणी सहायक हैं। "
+    "उपयोगकर्ता की बात समझकर प्राकृतिक भाषा में सहायता करें।",
     roles=("USER", "ASSISTANT"),
     version="llama_v2",
     messages=[],
@@ -194,7 +195,8 @@ conv_llama_2 = Conversation(
 )
 
 conv_llama_3 = Conversation(
-    system="You are a helpful language and speech assistant. " "You are able to understand the speech content that the user provides, " "and assist the user with a variety of tasks using natural language.",
+    system="आप एक सहायक भाषा और वाणी सहायक हैं। "
+    "उपयोगकर्ता की बात समझकर प्राकृतिक भाषा में सहायता करें।",
     roles=("user", "assistant"),
     version="llama_v3",
     messages=[],
@@ -224,5 +226,3 @@ conv_templates = {
 }
 
 
-if __name__ == "__main__":
-    print(default_conversation.default_conversation())

@@ -1,0 +1,130 @@
+data:
+  path: "data"
+  json_path: "${data.path}/datasets.json"  # source manifest; trainer_shard.py swaps in the selected shard
+  audio_root: "${data.path}/flac_sharded"
+  validation_split: 0.0
+  test_split: 0.0
+  train_fraction: 1.0
+  val_fraction: 1.0
+  test_fraction: 1.0
+  seed: 42
+  input_type: "mel"
+  mel_size: 128
+  num_workers: 4
+
+model:
+  name: "llama"
+  path: "models/llama"
+  config_path: "models/llama"
+  model_base: "models/llama"
+  tokenizer_path: "models/llama"
+  init_checkpoint: outputs/backbone_lora/vvlv9n93
+  model_max_length: 2048
+
+training:
+  num_train_epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 7
+  learning_rate: 0.000107467137359001
+  tune_speech_projector: true
+  tune_llm_backbone: true
+  tune_speech_encoder: false
+  use_lora: true
+  lora_r: 128
+  lora_alpha: 64
+  lora_dropout: 0.05
+  gradient_checkpointing: true
+  use_8bit_optimizer: false
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.05
+  weight_decay: 0.00
+  max_grad_norm: 1.8
+  precision: "bf16-mixed"
+  accelerator: "auto"
+  devices: "auto"
+  strategy: "auto"
+  log_every_n_steps: 20
+  val_check_interval: 0.25
+  fast_dev_run: false
+  attn_implementation: "sdpa"
+
+sharding:
+  source_json_path: "${data.path}/datasets.json"
+  manifest_dir: "${data.path}/shards/speech_20"
+  reuse_existing_manifests: true
+  train_source: "hf_split"
+  train_parquet_patterns:
+    - "data/batch_0000[0-9][0-9]-*.parquet"
+    - "data/batch_0001[0-9][0-9]-*.parquet"
+    - "data/batch_000200-*.parquet"
+    - "data/batch_000201-*.parquet"
+    - "data/batch_000202-*.parquet"
+    - "data/batch_000203-*.parquet"
+    - "data/batch_000204-*.parquet"
+    - "data/batch_000205-*.parquet"
+    - "data/batch_000206-*.parquet"
+    - "data/batch_000207-*.parquet"
+    - "data/batch_000208-*.parquet"
+    - "data/batch_000209-*.parquet"
+    - "data/batch_000210-*.parquet"
+  validation_source: "hf_split"
+  validation_fraction: 0.05
+  validation_parquet_patterns:
+    - "data/batch_000211-*.parquet"
+    - "data/batch_000212-*.parquet"
+    - "data/batch_000213-*.parquet"
+    - "data/batch_000214-*.parquet"
+    - "data/batch_000215-*.parquet"
+    - "data/batch_000216-*.parquet"
+    - "data/batch_000217-*.parquet"
+    - "data/batch_000218-*.parquet"
+    - "data/batch_000219-*.parquet"
+    - "data/batch_000220-*.parquet"
+    - "data/batch_000221-*.parquet"
+    - "data/batch_000222-*.parquet"
+  materialize_validation_audio: true
+  num_train_shards: 20
+  seed: ${data.seed}
+  strict_audio_coverage: true
+
+materialization:
+  enabled: true
+  repo_id: "Pastaaaaa2003/hindi-llama-omni"
+  repo_type: "dataset"
+  parquet_prefix: "data"
+  index_path: "${sharding.manifest_dir}/flac_to_parquet.json"
+  cache_dir: null  # speech_shard.sh overrides this to /tmp/hf_cache_${USER}_${run_id}
+  clear_hf_cache_before_download: true
+  hf_cache_root: null  # null means the default ~/.cache/huggingface/hub
+  batch_size: 512
+  max_workers: 4
+  progress_every: 1
+  delete_extra: true
+
+logging:
+  output_dir: "outputs/training_lora_speech_sharded"
+  log_file: "logs/train.log"
+  csv: true
+  csv_metrics_file: "csv/metrics.csv"
+  tensorboard: false
+  wandb: true
+  wandb_project: "hindi_llama_omni"
+  wandb_run_id: null
+  wandb_run_name: "hindi-backbone-lora-speech-sharded"
+  checkpoint_monitor: "val_loss"
+  checkpoint_format: "safetensors"
+  save_top_k: 1
+  save_last: true
+  save_weights_only: true
+  save_resume_state: true   # rolling Lightning .ckpt for exact resume
+  resume_state_dir: "trainer_state"
+
+resume:
+  path: null
+
+hydra:
+  run:
+    dir: ${logging.output_dir}/hydra/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ${logging.output_dir}/hydra_sweeps
+    subdir: ${hydra.job.num}

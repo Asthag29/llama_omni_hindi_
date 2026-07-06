@@ -24,15 +24,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-train = ["deepspeed==0.12.6", "ninja", "wandb", "tensorboardX", "pytorch-lightning"]
+train = ["ninja", "wandb", "tensorboardX", "pytorch-lightning==2.2.5", "torchmetrics>=0.11,<2.0", "tensorboard>=2.14.0", "loguru>=0.7.0"]
 build = ["build", "twine"]
 
 [tool.setuptools.packages.find]
 exclude = ["data", "checkpoints", "logs", "models", "fairseq", "flash-attention"]
 
 [tool.wheel]
-exclude = ["data", "checkpoints", "logs", "models", "fairseq", "flash-attention"]
+exclude = ["data", "checkpoints", "logs", "models", "fairseq", "flash-attention_2"]
 
 
 [tool.uv.extra-build-dependencies]
-file = ["pkg_resources"]
+file = ["pkg_resources"]  
+flash-attn = ["wheel"]
