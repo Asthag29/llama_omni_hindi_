@@ -6,7 +6,7 @@ data:
   test_split: 0.02
   train_fraction: 1.0
   val_fraction: 1.0
-  test_fraction: 1.0
+  test_fraction: 1.00
   seed: 42
   input_type: "mel"
   mel_size: 128
