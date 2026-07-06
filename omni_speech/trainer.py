@@ -11,7 +11,7 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset, Sampler, random_split
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset, random_split
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from omni_speech.constants import IGNORE_INDEX
@@ -19,9 +19,12 @@ from omni_speech.datasets.preprocess import preprocess, preprocess_multimodal
 from omni_speech.utils import (
     build_callbacks,
     build_loggers,
+    load_omni_speech_checkpoint,
     load_audio_16k,
     model_dtype,
     optional_abs_path,
+    resolve_checkpoint_path,
+    resolve_training_state_path,
     save_omni_speech_checkpoint,
 )
 from omni_speech.model.language_model.omni_speech_llama import (
@@ -222,6 +225,26 @@ class SpeechDataModule(pl.LightningDataModule):
         self.model_config = model_config
         self.train_dataset = None
         self.val_dataset = None
+        self.test_dataset = None
+
+    def _fraction_subset(self, dataset, fraction: float, seed_offset: int, name: str):
+        if dataset is None or fraction >= 1.0:
+            return dataset
+        if fraction <= 0.0:
+            raise ValueError(f"data.{name}_fraction must be in (0, 1], got {fraction}")
+
+        subset_size = max(1, int(round(len(dataset) * fraction)))
+        generator = torch.Generator().manual_seed(int(self.cfg.data.seed) + seed_offset)
+        indices = torch.randperm(len(dataset), generator=generator)[:subset_size].tolist()
+        print(f"Using {subset_size}/{len(dataset)} {name} samples ({fraction:.0%}).")
+        return Subset(dataset, indices)
+
+    @staticmethod
+    def _bounded_split_size(dataset_size: int, fraction: float, min_size: int, max_size: int) -> int:
+        if dataset_size <= 0 or fraction <= 0.0 or max_size <= 0:
+            return 0
+        size = int(round(dataset_size * fraction))
+        return max(min_size, min(max_size, size))
 
     def setup(self, stage=None):   #!need to understand this
         if self.train_dataset is not None:
@@ -237,20 +260,73 @@ class SpeechDataModule(pl.LightningDataModule):
         )
 
         val_split = float(self.cfg.data.validation_split)
-        if len(dataset) < 2 or val_split <= 0:
-            self.train_dataset = dataset
+        test_split = float(self.cfg.data.get("test_split", 0.0))
+        if val_split < 0 or test_split < 0:
+            raise ValueError("data.validation_split and data.test_split must be non-negative.")
+        if val_split + test_split >= 1.0:
+            raise ValueError("data.validation_split + data.test_split must be < 1.0.")
+
+        if len(dataset) < 2 or (val_split <= 0 and test_split <= 0):
+            self.train_dataset = self._fraction_subset(
+                dataset,
+                float(self.cfg.data.get("train_fraction", 1.0)),
+                101,
+                "train",
+            )
             self.val_dataset = None
+            self.test_dataset = None
             return
 
-        val_size = int(round(len(dataset) * val_split))
-        val_size = max(1, min(len(dataset) - 1, val_size))
-        train_size = len(dataset) - val_size
-        generator = torch.Generator().manual_seed(int(self.cfg.data.seed))  #manual_seed is used to ensure that the random split is reproducible
-        self.train_dataset, self.val_dataset = random_split(
-            dataset,
-            [train_size, val_size],
-            generator=generator,
+        dataset_size = len(dataset)
+        test_size = self._bounded_split_size(
+            dataset_size,
+            test_split,
+            min_size=1 if test_split > 0 else 0,
+            max_size=max(0, dataset_size - 1),
         )
+        remaining_after_test = dataset_size - test_size
+        val_size = self._bounded_split_size(
+            dataset_size,
+            val_split,
+            min_size=1 if val_split > 0 else 0,
+            max_size=max(0, remaining_after_test - 1),
+        )
+        train_size = dataset_size - val_size - test_size
+
+        generator = torch.Generator().manual_seed(int(self.cfg.data.seed))  #manual_seed is used to ensure that the random split is reproducible
+        splits = [train_size]
+        if val_size > 0:
+            splits.append(val_size)
+        if test_size > 0:
+            splits.append(test_size)
+        subsets = random_split(dataset, splits, generator=generator)
+
+        self.train_dataset = self._fraction_subset(
+            subsets[0],
+            float(self.cfg.data.get("train_fraction", 1.0)),
+            101,
+            "train",
+        )
+        next_idx = 1
+        if val_size > 0:
+            self.val_dataset = self._fraction_subset(
+                subsets[next_idx],
+                float(self.cfg.data.get("val_fraction", 1.0)),
+                202,
+                "val",
+            )
+            next_idx += 1
+        else:
+            self.val_dataset = None
+        if test_size > 0:
+            self.test_dataset = self._fraction_subset(
+                subsets[next_idx],
+                float(self.cfg.data.get("test_fraction", 1.0)),
+                303,
+                "test",
+            )
+        else:
+            self.test_dataset = None
 
     def train_dataloader(self):
         batch_size = self.cfg.training.batch_size
@@ -285,6 +361,18 @@ class SpeechDataModule(pl.LightningDataModule):
             pin_memory=torch.cuda.is_available(),
         )
 
+    def test_dataloader(self):
+        if self.test_dataset is None:
+            return None
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.cfg.training.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.data.num_workers,
+            collate_fn=SpeechCollator(self.tokenizer),
+            pin_memory=torch.cuda.is_available(),
+        )
+
 
 class OmniSpeechTrainingModule(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
@@ -294,9 +382,11 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         self.tokenizer, self.model = self._load_model_and_tokenizer()
         self.speech_dtype = model_dtype(cfg.training.precision)
         self._maybe_apply_lora()
+        self._maybe_load_init_checkpoint()
         self._configure_trainable_parameters()
         self._maybe_enable_gradient_checkpointing()
         self._promote_trainable_params_to_fp32()
+        self._accumulated_microbatch_losses = []
 
     def _get_inner_speech_model(self): #! need to check this for training with print statements
         model = self.model
@@ -338,6 +428,14 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         self.model = get_peft_model(self.model, lora_config)
         self.model.print_trainable_parameters()
 
+    def _maybe_load_init_checkpoint(self):
+        init_path = self.cfg.model.get("init_checkpoint")
+        if not init_path:
+            return
+        checkpoint_path = resolve_checkpoint_path(optional_abs_path(init_path))
+        print(f"Initializing speech trainer weights from {checkpoint_path}")
+        load_omni_speech_checkpoint(self, checkpoint_path, adapter_trainable=True)
+
     def _configure_trainable_parameters(self):
         tune_projector = bool(self.cfg.training.get("tune_speech_projector", True))
         tune_llm = bool(self.cfg.training.get("tune_llm_backbone", False))
@@ -368,10 +466,7 @@ class OmniSpeechTrainingModule(pl.LightningModule):
                 for param in speech_encoder.parameters():
                     param.requires_grad = True
             else:
-                if "deepspeed" in str(self.cfg.training.strategy):
-                    speech_encoder.train()
-                else:
-                    speech_encoder.eval()
+                speech_encoder.eval()
                 for param in speech_encoder.parameters():
                     param.requires_grad = False
 
@@ -438,12 +533,6 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         speech_encoder = self._get_inner_speech_model().get_speech_encoder()
         if speech_encoder is None:
             return
-        if "deepspeed" in str(self.cfg.training.strategy):
-            # ZeRO-3 requires modules that execute in forward to have training=True
-            # when its backward hooks run. Parameters remain frozen, and the encoder
-            # forward is wrapped in no_grad() in encode_speech.
-            speech_encoder.train()
-            return
         speech_encoder.eval()
 
     def on_train_epoch_start(self):
@@ -465,6 +554,7 @@ class OmniSpeechTrainingModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         outputs = self(batch)
         loss = outputs.loss
+        self._accumulated_microbatch_losses.append(loss.detach())
         self.log(
             "train_loss",
             loss,
@@ -488,6 +578,80 @@ class OmniSpeechTrainingModule(pl.LightningModule):
             batch_size=batch["input_ids"].shape[0],
         )
         return loss
+
+    def _log_param_group_stats(self, name: str, grad_norms: List[torch.Tensor], weight_norms: List[torch.Tensor]) -> None:
+        if not grad_norms:
+            return
+        grad_norm = torch.stack(grad_norms).norm(2)
+        weight_norm = torch.stack(weight_norms).norm(2)
+        grad_weight_ratio = grad_norm / weight_norm.clamp_min(1e-12)
+        self.log(
+            f"grad_norm_{name}",
+            grad_norm,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+        )
+        self.log(
+            f"grad_weight_ratio_{name}",
+            grad_weight_ratio,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+        )
+
+    def on_before_optimizer_step(self, optimizer):
+        if self._accumulated_microbatch_losses:
+            effective_batch_loss = torch.stack(self._accumulated_microbatch_losses).mean()
+            self.log(
+                "train_loss_accum",
+                effective_batch_loss,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                sync_dist=True,
+            )
+            self._accumulated_microbatch_losses.clear()
+
+        trainable_params = [
+            param
+            for param in self.parameters()
+            if param.requires_grad and param.grad is not None
+        ]
+        if not trainable_params:
+            return
+
+        grad_norms = [param.grad.detach().float().norm(2) for param in trainable_params]
+        weight_norms = [param.detach().float().norm(2) for param in trainable_params]
+        self._log_param_group_stats("global", grad_norms, weight_norms)
+
+        lora_a_grad_norms = []
+        lora_a_weight_norms = []
+        lora_b_grad_norms = []
+        lora_b_weight_norms = []
+        projector_grad_norms = []
+        projector_weight_norms = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad or param.grad is None:
+                continue
+
+            grad_norm = param.grad.detach().float().norm(2)
+            weight_norm = param.detach().float().norm(2)
+            if "lora_A" in name:
+                lora_a_grad_norms.append(grad_norm)
+                lora_a_weight_norms.append(weight_norm)
+            elif "lora_B" in name:
+                lora_b_grad_norms.append(grad_norm)
+                lora_b_weight_norms.append(weight_norm)
+            elif "speech_projector" in name:
+                projector_grad_norms.append(grad_norm)
+                projector_weight_norms.append(weight_norm)
+
+        self._log_param_group_stats("lora_A", lora_a_grad_norms, lora_a_weight_norms)
+        self._log_param_group_stats("lora_B", lora_b_grad_norms, lora_b_weight_norms)
+        self._log_param_group_stats("speech_projector", projector_grad_norms, projector_weight_norms)
 
     def configure_optimizers(self):
         trainable_params = [param for param in self.parameters() if param.requires_grad]
@@ -553,7 +717,14 @@ def main(cfg: DictConfig):
         enable_checkpointing=False,
     )
 
-    trainer.fit(module, datamodule=data_module)
+    resume_cfg = cfg.get("resume")
+    resume_path = resume_cfg.get("path") if resume_cfg is not None else None
+    ckpt_path = None
+    if resume_path:
+        ckpt_path = resolve_training_state_path(resume_path)
+        print(f"Resuming trainer state from {ckpt_path}")
+
+    trainer.fit(module, datamodule=data_module, ckpt_path=ckpt_path)
     final_dir = to_absolute_path(os.path.join(cfg.logging.output_dir, "final_model"))
     save_omni_speech_checkpoint(module, final_dir, metadata={"final": True})
     if trainer.global_rank == 0:

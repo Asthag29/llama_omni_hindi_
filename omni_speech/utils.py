@@ -145,27 +145,11 @@ class StreamToLogger(object):
         self.linebuf = ''
 
 
-def maybe_zero_3(param, ignore_status=False, name=None):
-    from deepspeed import zero
-    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-    if hasattr(param, "ds_id"):
-        if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-            if not ignore_status:
-                logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
-        with zero.GatheredParameters([param]):
-            param = param.data.detach().cpu().clone()
-    else:
-        param = param.detach().cpu().clone()
-    return param
+def _copy_param(param: torch.Tensor) -> torch.Tensor:
+    return param.detach().cpu().clone()
 
 
-#* zero 3  sharding 
-# GPU 0: 25% of weights + 25% of gradients + 25% optimizer states
-# GPU 1: 25% of weights + 25% of gradients + 25% optimizer states
-# GPU 2: 25% of weights + 25% of gradients + 25% optimizer states
-# GPU 3: 25% of weights + 25% of gradients + 25% optimizer states
-# Borrowed from peft.utils.get_peft_model_state_dict
-def get_peft_state_maybe_zero_3(named_params, bias):
+def get_peft_state(named_params, bias):
     if bias == "none":
         to_return = {k: t for k, t in named_params if "lora_" in k}
     elif bias == "all":
@@ -186,21 +170,21 @@ def get_peft_state_maybe_zero_3(named_params, bias):
                 to_return[bias_name] = t
     else:
         raise NotImplementedError
-    to_return = {k: maybe_zero_3(v, ignore_status=True) for k, v in to_return.items()}
+    to_return = {k: _copy_param(v) for k, v in to_return.items()}
     return to_return
 
 
-def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
+def get_peft_state_non_lora(named_params, require_grad_only=True):
     to_return = {k: t for k, t in named_params if "lora_" not in k}
     if require_grad_only:
         to_return = {k: t for k, t in to_return.items() if t.requires_grad}
-    to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
+    to_return = {k: _copy_param(v) for k, v in to_return.items()}
     return to_return
 
 
-def get_speech_projector_state_maybe_zero_3(named_params, keys_to_match):
+def get_speech_projector_state(named_params, keys_to_match):
     to_return = {k: t for k, t in named_params if any(key_match in k for key_match in keys_to_match)}
-    to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
+    to_return = {k: _copy_param(v) for k, v in to_return.items()}
     return to_return
 
 
@@ -230,7 +214,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
 
-        weight_to_save = get_speech_projector_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
+        weight_to_save = get_speech_projector_state(trainer.model.named_parameters(), keys_to_match)
         trainer.model.config.save_pretrained(output_dir)
 
         current_folder = output_dir.split('/')[-1]
@@ -242,11 +226,6 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                 torch.save(weight_to_save, os.path.join(speech_projector_folder, f'{current_folder}.bin'))
             else:
                 torch.save(weight_to_save, os.path.join(output_dir, f'speech_projector.bin'))
-        return
-
-    if trainer.deepspeed:
-        torch.cuda.synchronize()
-        trainer.save_model(output_dir)
         return
 
     state_dict = trainer.model.state_dict()
@@ -341,25 +320,39 @@ def resolve_checkpoint_path(path: str) -> str:
     raise FileNotFoundError(f"No checkpoints found under: {path}")
 
 
-def _is_deepspeed_zero3(module) -> bool:
-    """Check if the Lightning module is running under DeepSpeed ZeRO-3."""
-    try:
-        from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-        for p in module.parameters():
-            if hasattr(p, "ds_id"):
-                return True
-    except ImportError:
-        pass
-    return False
+def resolve_training_state_path(path: str) -> str:
+    path = os.path.abspath(os.path.expanduser(path))
+    if os.path.isfile(path):
+        if not path.endswith(".ckpt"):
+            raise ValueError(f"Resume state must be a Lightning .ckpt file, got: {path}")
+        return path
+    if is_safetensors_checkpoint(path):
+        raise ValueError(
+            f"{path} is a weights-only safetensors checkpoint. "
+            "Full resume requires a Lightning trainer-state .ckpt file."
+        )
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"Training state checkpoint not found: {path}")
 
+    preferred = [
+        os.path.join(path, "trainer_state", "last.ckpt"),
+        os.path.join(path, "last.ckpt"),
+    ]
+    for candidate in preferred:
+        if os.path.isfile(candidate):
+            return candidate
+
+    discovered = []
+    for root, _, files in os.walk(path):
+        for name in files:
+            if name.endswith(".ckpt"):
+                discovered.append(os.path.join(root, name))
+    if discovered:
+        return max(discovered, key=os.path.getmtime)
+    raise FileNotFoundError(f"No Lightning trainer-state .ckpt file found under: {path}")
 
 def _gather_param(param: torch.Tensor) -> torch.Tensor:
-    """Gather a ZeRO-3 partitioned parameter to full on the current rank."""
-    if not hasattr(param, "ds_id"):
-        return param.detach().cpu().clone()
-    from deepspeed import zero
-    with zero.GatheredParameters([param]):
-        return param.detach().cpu().clone()
+    return param.detach().cpu().clone()
 
 
 def save_omni_speech_checkpoint(module, output_dir: str, metadata: Optional[Dict] = None) -> None:
@@ -367,16 +360,10 @@ def save_omni_speech_checkpoint(module, output_dir: str, metadata: Optional[Dict
 
     os.makedirs(output_dir, exist_ok=True)
     model = module.model
-    zero3 = _is_deepspeed_zero3(module)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     if isinstance(model, PeftModel):
-        if zero3:
-            from deepspeed import zero
-            params = list(model.parameters())
-            with zero.GatheredParameters(params, modifier_rank=0):
-                if torch.distributed.get_rank() == 0:
-                    model.save_pretrained(output_dir, safe_serialization=True)
-        else:
+        if rank == 0:
             model.save_pretrained(output_dir, safe_serialization=True)
     else:
         trainable = {
@@ -384,32 +371,36 @@ def save_omni_speech_checkpoint(module, output_dir: str, metadata: Optional[Dict
             for name, param in module.named_parameters()
             if param.requires_grad
         }
-        if trainable:
+        if trainable and rank == 0:
             save_file(trainable, os.path.join(output_dir, "trainable.safetensors"))
 
     inner = module._get_inner_speech_model()
     if getattr(inner, "speech_projector", None) is not None:
         state = {k: _gather_param(v) for k, v in inner.speech_projector.state_dict().items()}
-        if not zero3 or torch.distributed.get_rank() == 0:
+        if rank == 0:
             save_file(state, os.path.join(output_dir, "speech_projector.safetensors"))
 
     if metadata is not None:
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         if rank == 0:
             with open(os.path.join(output_dir, "checkpoint_meta.json"), "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2)
 
 
-def load_omni_speech_checkpoint(module, checkpoint_dir: str) -> None:
-    from peft import PeftModel
+def load_omni_speech_checkpoint(module, checkpoint_dir: str, adapter_trainable: bool = False) -> None:
+    from peft import PeftModel, load_peft_weights, set_peft_model_state_dict
 
     adapter = os.path.join(checkpoint_dir, "adapter_model.safetensors")
     if os.path.isfile(adapter):
         if not isinstance(module.model, PeftModel):
             raise RuntimeError("LoRA checkpoint loaded into a non-LoRA model.")
-        module.model = PeftModel.from_pretrained(
-            module.model.get_base_model(), checkpoint_dir, is_trainable=False
-        )
+        adapter_state = load_peft_weights(checkpoint_dir, device="cpu")
+        incompat = set_peft_model_state_dict(module.model, adapter_state, adapter_name="default")
+        if getattr(incompat, "unexpected_keys", None):
+            raise RuntimeError(f"Unexpected LoRA keys when loading {checkpoint_dir}: {incompat.unexpected_keys}")
+        if not adapter_trainable:
+            for name, param in module.model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad = False
 
     inner = module._get_inner_speech_model()
     projector = os.path.join(checkpoint_dir, "speech_projector.safetensors")
@@ -483,6 +474,36 @@ class SafetensorsCheckpointCallback(Callback):
         self._on_epoch_end(trainer, pl_module)
 
 
+class ResumeStateCheckpointCallback(Callback):
+    """Persist one rolling Lightning checkpoint with optimizer/scheduler state."""
+
+    def __init__(self, dirpath: str, filename: str = "last.ckpt"):
+        self.dirpath = dirpath
+        self.filename = filename
+        os.makedirs(self.dirpath, exist_ok=True)
+
+    @property
+    def path(self) -> str:
+        return os.path.join(self.dirpath, self.filename)
+
+    def _save(self, trainer) -> None:
+        trainer.save_checkpoint(self.path, weights_only=False)
+
+    def on_validation_epoch_end(self, trainer, pl_module) -> None:
+        self._save(trainer)
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        if getattr(trainer, "num_val_dataloaders", 0) > 0:
+            return
+        self._save(trainer)
+
+    def on_exception(self, trainer, pl_module, exception) -> None:
+        self._save(trainer)
+
+    def on_train_end(self, trainer, pl_module) -> None:
+        self._save(trainer)
+
+
 def build_loggers(cfg: DictConfig):
     output_dir = to_absolute_path(str(cfg.logging.output_dir))
     loggers = []
@@ -495,6 +516,7 @@ def build_loggers(cfg: DictConfig):
         loggers.append(
             WandbLogger(
                 project=cfg.logging.wandb_project,
+                id=cfg.logging.get("wandb_run_id"),
                 name=cfg.logging.get("wandb_run_name"),
                 save_dir=output_dir,
                 config=OmegaConf.to_container(cfg, resolve=True),
@@ -541,11 +563,18 @@ def build_callbacks(cfg: DictConfig, has_validation: bool):
             output_dir,
             str(cfg.logging.get("csv_metrics_file", "csv/metrics.csv")),
         )
-    return [
+    callbacks = [
         checkpoint_callback,
         LearningRateMonitor(logging_interval="step"),
         LocalMetricsLogCallback(log_path=log_path, csv_path=csv_path),
     ]
+    if bool(cfg.logging.get("save_resume_state", False)):
+        resume_dir = os.path.join(
+            output_dir,
+            str(cfg.logging.get("resume_state_dir", "trainer_state")),
+        )
+        callbacks.append(ResumeStateCheckpointCallback(dirpath=resume_dir))
+    return callbacks
 
 
 # --- Training log (loguru) ---
@@ -596,9 +625,7 @@ class LocalMetricsLogCallback(Callback):
     def __init__(self, log_path: str, csv_path: str | None = None):
         self.log_path = log_path
         self.csv_path = csv_path
-        self.step_log_path = os.path.join(os.path.dirname(log_path), "train_perstep.log")
         self.epoch_records = {}
-        self.step_records = {}
         self._logger = None
 
     def _write_epoch_csv(self) -> None:
@@ -631,17 +658,6 @@ class LocalMetricsLogCallback(Callback):
             f.write("Training log\n")
             f.write(format_metrics_table(self.LOG_HEADERS, rows))
             f.write("\n")
-
-    def _write_step_log(self) -> None:
-        os.makedirs(os.path.dirname(self.step_log_path), exist_ok=True)
-        with open(self.step_log_path, "w", encoding="utf-8") as f:
-            f.write("Per-step training loss\n")
-            for _, record in sorted(self.step_records.items()):
-                f.write(
-                    f"epoch={record['epoch']} step={record['step']} "
-                f"lr={self._fmt(record['lr'], digits=9)} "
-                    f"train_loss_step={self._fmt(record['train_loss'], digits=6)}\n"
-                )
 
     def _logger_instance(self):
         if self._logger is None:
@@ -698,10 +714,8 @@ class LocalMetricsLogCallback(Callback):
         if trainer.global_rank != 0 or not self.csv_path:
             return
         self.epoch_records = {}
-        self.step_records = {}
         self._write_epoch_log()
         self._write_epoch_csv()
-        self._write_step_log()
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
         if trainer.global_rank != 0:
@@ -709,17 +723,8 @@ class LocalMetricsLogCallback(Callback):
         train_loss = self._metric(trainer, "train_loss")
         if train_loss is None:
             return
-        lr = self._metric(trainer, "lr-AdamW") or self._current_lr(trainer)
-        key = (trainer.current_epoch, trainer.global_step)
-        if key in self.step_records:
-            return
-        self.step_records[key] = {
-            "epoch": trainer.current_epoch,
-            "step": trainer.global_step,
-            "lr": lr,
-            "train_loss": train_loss,
-        }
-        self._write_step_log()
+        # Per-step metrics still go to Lightning/W&B/CSV summaries; we no longer
+        # mirror them into a separate local train_perstep.log file.
 
     def on_validation_epoch_end(self, trainer, pl_module) -> None:
         self._record_epoch(trainer)

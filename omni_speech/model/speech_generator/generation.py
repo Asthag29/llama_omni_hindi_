@@ -18,7 +18,6 @@ from transformers.generation.utils import (
     GenerateEncoderDecoderOutput,
     GenerateDecoderOnlyOutput,
     GenerateNonBeamOutput,
-    is_deepspeed_zero3_enabled,
 #    is_torchdynamo_compiling,
     NEED_SETUP_CACHE_CLASSES_MAPPING,
     QUANT_BACKEND_CLASSES_MAPPING,
@@ -67,10 +66,7 @@ class GenerationWithCTC(GenerationMixin):
 
         # 2. Set generation parameters if not already defined
         if synced_gpus is None:
-            if is_deepspeed_zero3_enabled() and dist.get_world_size() > 1:
-                synced_gpus = True
-            else:
-                synced_gpus = False
+            synced_gpus = bool(dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1)
 
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
