@@ -8,6 +8,7 @@ parquet rows in the dataloader.
 from __future__ import annotations
 
 import copy
+import fnmatch
 import io
 import json
 import math
@@ -22,6 +23,7 @@ import soundfile as sf
 import torch
 import torchaudio
 import whisper
+from huggingface_hub import HfApi
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 from torch.optim import AdamW
@@ -29,16 +31,24 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from transformers import get_cosine_schedule_with_warmup
 
 from omni_speech.datasets.preprocess import preprocess, preprocess_multimodal
-from omni_speech.datasets.processing.materialize_shard_audio import (
-    FIRST_TURN_PROMPT,
-    list_matching_parquet_files,
-)
-from omni_speech.trainer import OmniSpeechTrainingModule, SpeechCollator
-from omni_speech.utils import (
+from omni_speech.trainer_combined import OmniSpeechTrainingModule, SpeechCollator
+from omni_speech.train_utils import (
     build_callbacks,
     build_loggers,
     save_omni_speech_checkpoint,
 )
+
+FIRST_TURN_PROMPT = "<speech>\nकृपया उपयोगकर्ता के भाषण में प्रश्नों का सीधे उत्तर दें।"
+
+
+def list_matching_parquet_files(repo_id: str, repo_type: str, parquet_prefix: str, patterns: Iterable[str]) -> list[str]:
+    repo_files = HfApi().list_repo_files(repo_id=repo_id, repo_type=repo_type)
+    prefix = parquet_prefix.strip("/")
+    matches: list[str] = []
+    for pattern in patterns:
+        full_pattern = f"{prefix}/{pattern}" if prefix and not str(pattern).startswith(f"{prefix}/") else str(pattern)
+        matches.extend(fnmatch.filter(repo_files, full_pattern))
+    return sorted(set(matches))
 
 
 def _partition_info() -> tuple[int, int]:
@@ -76,20 +86,23 @@ def _resolve_hf_data_files(cfg: DictConfig, patterns: Iterable[str]) -> list[str
 
 def _load_streaming_dataset(data_files: list[str], split_name: str, cache_dir: str | None):
     try:
-        from datasets import load_dataset
+        from datasets import Audio, load_dataset
     except ImportError as exc:
         raise ImportError(
             "HF streaming training requires the `datasets` package. "
-            "Install it in the environment before running trainer_streaming.py."
+            "Install it in the environment before running trainer_stage_2.py."
         ) from exc
 
-    return load_dataset(
+    dataset = load_dataset(
         "parquet",
         data_files={split_name: data_files},
         split=split_name,
         streaming=True,
         cache_dir=cache_dir,
     )
+    # Keep raw audio bytes/path in rows. If HF Datasets decodes Audio itself, it
+    # requires torchcodec in recent versions; our loader already decodes bytes.
+    return dataset.cast_column("audio", Audio(decode=False))
 
 
 def _resample_if_needed(audio: np.ndarray, source_rate: int, target_rate: int = 16000) -> np.ndarray:
@@ -156,6 +169,7 @@ class HFStreamingSpeechDataset(IterableDataset):
         repeat: bool,
         input_type: str = "mel",
         mel_size: int = 128,
+        compute_mel_on_gpu: bool = False,
     ):
         self.data_files = data_files
         self.tokenizer = tokenizer
@@ -168,6 +182,8 @@ class HFStreamingSpeechDataset(IterableDataset):
         self.repeat = repeat
         self.input_type = input_type
         self.mel_size = int(mel_size)
+        self.compute_mel_on_gpu = bool(compute_mel_on_gpu)
+        self._skipped_overlength = 0
         self.data_args = type(
             "DataArgs",
             (),
@@ -182,8 +198,22 @@ class HFStreamingSpeechDataset(IterableDataset):
         conversations = _row_to_conversations(row)
         source = preprocess_multimodal([conversations], self.data_args)[0]
         text = preprocess([source], self.tokenizer, has_speech=True)
+        token_length = int(text["input_ids"].shape[-1])
+        max_length = int(self.tokenizer.model_max_length)
+        if token_length > max_length:
+            self._skipped_overlength += 1
+            if self._skipped_overlength <= 10 or self._skipped_overlength % 100 == 0:
+                sample_id = row.get("id", "<unknown>")
+                print(
+                    f"Skipped overlength streaming sample "
+                    f"split={self.split_name} id={sample_id} "
+                    f"tokens={token_length} max={max_length} "
+                    f"skipped_overlength={self._skipped_overlength}",
+                    flush=True,
+                )
+            return None
 
-        if self.input_type == "raw":
+        if self.input_type == "raw" or (self.input_type == "mel" and self.compute_mel_on_gpu):
             speech = torch.from_numpy(audio)
             if getattr(self.model_config, "speech_normalize", False):
                 speech = torch.nn.functional.layer_norm(speech, speech.shape)
@@ -241,6 +271,20 @@ class HFStreamingSpeechDataModule(pl.LightningDataModule):
         self.train_files: list[str] = []
         self.val_files: list[str] = []
 
+    def _loader_kwargs(self) -> dict:
+        num_workers = int(self.cfg.data.num_workers)
+        kwargs = {
+            "num_workers": num_workers,
+            "collate_fn": SpeechCollator(self.tokenizer),
+            "pin_memory": torch.cuda.is_available(),
+        }
+        if num_workers > 0:
+            kwargs["prefetch_factor"] = int(self.cfg.data.get("prefetch_factor", 2))
+            kwargs["persistent_workers"] = bool(
+                self.cfg.data.get("persistent_workers", False)
+            )
+        return kwargs
+
     def setup(self, stage=None):
         streaming_cfg = self.cfg.streaming
         if not self.train_files:
@@ -270,13 +314,12 @@ class HFStreamingSpeechDataModule(pl.LightningDataModule):
             repeat=True,
             input_type=self.cfg.data.input_type,
             mel_size=int(self.cfg.data.mel_size),
+            compute_mel_on_gpu=bool(self.cfg.data.get("compute_mel_on_gpu", False)),
         )
         return DataLoader(
             dataset,
             batch_size=int(self.cfg.training.batch_size),
-            num_workers=int(self.cfg.data.num_workers),
-            collate_fn=SpeechCollator(self.tokenizer),
-            pin_memory=torch.cuda.is_available(),
+            **self._loader_kwargs(),
         )
 
     def val_dataloader(self):
@@ -295,13 +338,12 @@ class HFStreamingSpeechDataModule(pl.LightningDataModule):
             repeat=False,
             input_type=self.cfg.data.input_type,
             mel_size=int(self.cfg.data.mel_size),
+            compute_mel_on_gpu=bool(self.cfg.data.get("compute_mel_on_gpu", False)),
         )
         return DataLoader(
             dataset,
             batch_size=int(self.cfg.training.batch_size),
-            num_workers=int(self.cfg.data.num_workers),
-            collate_fn=SpeechCollator(self.tokenizer),
-            pin_memory=torch.cuda.is_available(),
+            **self._loader_kwargs(),
         )
 
 
@@ -320,26 +362,81 @@ def compute_validation_interval_batches(train_samples: int, batch_size: int, val
 class HFStreamingTrainingModule(OmniSpeechTrainingModule):
     def __init__(self, cfg: DictConfig, total_optimizer_steps: int):
         self.total_optimizer_steps = total_optimizer_steps
+        self.microbatches_per_epoch = math.ceil(
+            int(cfg.streaming.train_samples) / int(cfg.training.batch_size)
+        )
+        self.optimizer_steps_per_epoch = math.ceil(
+            self.microbatches_per_epoch / int(cfg.training.gradient_accumulation_steps)
+        )
         super().__init__(cfg)
+
+    def _maybe_compute_mel_on_gpu(self, batch):
+        if self.cfg.data.input_type != "mel" or not bool(
+            self.cfg.data.get("compute_mel_on_gpu", False)
+        ):
+            return batch
+
+        speech = batch["speech"].to(self.device, dtype=torch.float32, non_blocking=True)
+        speech = whisper.pad_or_trim(speech)
+        mel = whisper.log_mel_spectrogram(
+            speech,
+            n_mels=int(self.cfg.data.mel_size),
+        ).permute(0, 2, 1)
+
+        batch = dict(batch)
+        batch["speech"] = mel
+        batch["speech_lengths"] = torch.full(
+            (mel.shape[0],),
+            mel.shape[1],
+            dtype=torch.long,
+            device=self.device,
+        )
+        return batch
+
+    def forward(self, batch):
+        return super().forward(self._maybe_compute_mel_on_gpu(batch))
+
+    def _log_streaming_progress(self, batch_idx: int) -> None:
+        completed_microbatches = int(self.global_step) * int(
+            self.cfg.training.gradient_accumulation_steps
+        ) + int(batch_idx) % int(self.cfg.training.gradient_accumulation_steps)
+        true_epoch = completed_microbatches / max(1, self.microbatches_per_epoch)
+        self.log(
+            "streaming_true_epoch",
+            true_epoch,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            sync_dist=True,
+        )
+        self.log(
+            "streaming_microbatch_progress",
+            float(completed_microbatches),
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+        )
+        self.log(
+            "streaming_optimizer_epoch",
+            float(self.global_step) / max(1, self.optimizer_steps_per_epoch),
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+        )
+
+    def training_step(self, batch, batch_idx):
+        self._log_streaming_progress(batch_idx)
+        return super().training_step(batch, batch_idx)
 
     def configure_optimizers(self):
         trainable_params = [param for param in self.parameters() if param.requires_grad]
-        use_8bit = bool(self.cfg.training.get("use_8bit_optimizer", False))
-        if use_8bit:
-            import bitsandbytes as bnb
-
-            optimizer = bnb.optim.AdamW8bit(
-                trainable_params,
-                lr=self.cfg.training.learning_rate,
-                weight_decay=self.cfg.training.weight_decay,
-            )
-            print("Using 8-bit AdamW optimizer.")
-        else:
-            optimizer = AdamW(
-                trainable_params,
-                lr=self.cfg.training.learning_rate,
-                weight_decay=self.cfg.training.weight_decay,
-            )
+        optimizer = AdamW(
+            trainable_params,
+            lr=self.cfg.training.learning_rate,
+            weight_decay=self.cfg.training.weight_decay,
+        )
 
         if self.cfg.training.lr_scheduler_type != "cosine":
             return optimizer
@@ -365,7 +462,7 @@ class HFStreamingTrainingModule(OmniSpeechTrainingModule):
         }
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="speech_streaming")
+@hydra.main(version_base=None, config_path="../configs", config_name="stage_2")
 def main(cfg: DictConfig):
     pl.seed_everything(int(cfg.data.seed), workers=True)
 

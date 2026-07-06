@@ -3,7 +3,7 @@ from datasets import load_dataset
 from os import path
 import yaml
 
-with open('configs/speech.yaml', 'r') as f:
+with open('configs/combined.yaml', 'r') as f:
     config = yaml.safe_load(f)
     data_path = config['data']['path']
 

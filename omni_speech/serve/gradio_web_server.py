@@ -13,7 +13,7 @@ import soundfile as sf
 
 from omni_speech.conversation import default_conversation, conv_templates
 from omni_speech.constants import LOGDIR
-from omni_speech.utils import build_logger, server_error_msg
+from omni_speech.train_utils import build_logger, server_error_msg
 from fairseq.models.text_to_speech.vocoder import CodeHiFiGANVocoder
 
 

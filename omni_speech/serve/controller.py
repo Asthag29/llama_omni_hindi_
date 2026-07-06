@@ -19,7 +19,7 @@ import requests
 import uvicorn
 
 from omni_speech.constants import CONTROLLER_HEART_BEAT_EXPIRATION
-from omni_speech.utils import build_logger, server_error_msg
+from omni_speech.train_utils import build_logger, server_error_msg
 
 
 logger = build_logger("controller", "controller.log")

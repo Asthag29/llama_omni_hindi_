@@ -20,7 +20,7 @@ from functools import partial
 from transformers import PreTrainedTokenizer
 
 from omni_speech.constants import WORKER_HEART_BEAT_INTERVAL
-from omni_speech.utils import (build_logger, server_error_msg,
+from omni_speech.train_utils import (build_logger, server_error_msg,
     pretty_print_semaphore)
 from omni_speech.model.builder import load_pretrained_model
 from omni_speech.constants import SPEECH_TOKEN_INDEX, DEFAULT_SPEECH_TOKEN
