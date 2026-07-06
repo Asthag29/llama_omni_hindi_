@@ -5,7 +5,10 @@ data:
   mel_size: 128
   # Keep streaming workers at 0 by default. Multiple workers can duplicate HF
   # stream reads because each worker must skip rows assigned to other workers.
-  num_workers: 0
+  num_workers: 2
+  prefetch_factor: 2
+  persistent_workers: true
+  compute_mel_on_gpu: false
 
 model:
   name: "llama"
@@ -13,7 +16,7 @@ model:
   config_path: "models/llama"
   model_base: "models/llama"
   tokenizer_path: "models/llama"
-  init_checkpoint: outputs/backbone_lora/vvlv9n93
+  init_checkpoint: outputs/stage_1/backbone_text/final_model
   model_max_length: 2048
 
 training:
@@ -29,18 +32,15 @@ training:
   lora_alpha: 64
   lora_dropout: 0.05
   gradient_checkpointing: true
-  use_8bit_optimizer: false
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.05
-  weight_decay: 0.00
+  weight_decay: 0.01
   max_grad_norm: 1.8
   precision: "bf16-mixed"
   accelerator: "auto"
   devices: "auto"
   strategy: "auto"
   log_every_n_steps: 20
-  # trainer_streaming.py converts this fraction into true-epoch microbatch
-  # intervals because IterableDataset has no __len__ for Lightning to inspect.
   val_check_interval: 0.25
   fast_dev_run: false
   attn_implementation: "sdpa"
@@ -52,7 +52,7 @@ streaming:
   cache_dir: null
   train_samples: 105000
   validation_samples: 5720
-  shuffle_buffer_size: 2048
+  shuffle_buffer_size: 64
   train_parquet_patterns:
     - "data/batch_0000[0-9][0-9]-*.parquet"
     - "data/batch_0001[0-9][0-9]-*.parquet"
@@ -82,7 +82,7 @@ streaming:
     - "data/batch_000222-*.parquet"
 
 logging:
-  output_dir: "outputs/training_lora_speech_streaming"
+  output_dir: "outputs/stage_2/speech_text"
   log_file: "logs/train.log"
   csv: true
   csv_metrics_file: "csv/metrics.csv"
@@ -90,7 +90,7 @@ logging:
   wandb: true
   wandb_project: "hindi_llama_omni"
   wandb_run_id: null
-  wandb_run_name: "speech-hf-streaming"
+  wandb_run_name: "stage-2-speech-text"
   checkpoint_monitor: "val_loss"
   checkpoint_format: "safetensors"
   save_top_k: 1

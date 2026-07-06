@@ -15,31 +15,21 @@ indic.py
 
 logs/
 outputs/
-train_slurm.sh
-train_backbone.sh
-run_wandb_backbone_sweep.sh
 uv.lock
 
 delete_folder/
 
 *.sh
+*.sbatch
 .cache/
 .ipynb_checkpoints/
 .uv-cache/
 .venv/
 .venv*/
-data/
-delete_folder/
-llama_omni.egg-info/
-logs/
-models/
-outputs/
 wandb/
-*.sh
-*.sbatch
-uv.lock
-backbone.sbatch
-sweep.sbatch
-
 
 __pycache__/
+
+# Generated evaluation outputs.
+evaluations/results/*.json
+!evaluations/results/speech_streaming_validation.json
