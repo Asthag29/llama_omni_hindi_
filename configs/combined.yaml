@@ -18,7 +18,7 @@ model:
   config_path: "models/llama"
   model_base: "models/llama"
   tokenizer_path: "models/llama"
-  init_checkpoint: outputs/backbone_lora/vvlv9n93
+  init_checkpoint: outputs/stage_1/backbone_text/final_model
   model_max_length: 2048
 
 training:
@@ -34,7 +34,6 @@ training:
   lora_alpha: 64  # scaling factor = r/alpha
   lora_dropout: 0.05
   gradient_checkpointing: true
-  use_8bit_optimizer: false
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.05
   weight_decay: 0.00
@@ -49,7 +48,7 @@ training:
   attn_implementation: "sdpa"
 
 logging:
-  output_dir: "outputs/training_lora_speech"
+  output_dir: "outputs/combined/speech_text"
   log_file: "logs/train.log"
   csv: true
   csv_metrics_file: "csv/metrics.csv"
@@ -57,7 +56,7 @@ logging:
   wandb: true
   wandb_project: "hindi_llama_omni"
   wandb_run_id: null
-  wandb_run_name: "hindi-backbone-lora-speech"
+  wandb_run_name: "combined-speech-text"
   checkpoint_monitor: "val_loss"
   checkpoint_format: "safetensors"
   save_top_k: 1

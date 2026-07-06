@@ -28,7 +28,6 @@ training:
   lora_alpha: 64  #64
   lora_dropout: 0.05
   gradient_checkpointing: true
-  use_8bit_optimizer: false
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.05  #9% of the first epoch 
   weight_decay: 0.00
@@ -43,7 +42,7 @@ training:
   attn_implementation: "sdpa"
 
 logging:
-  output_dir: "outputs/backbone_lora"
+  output_dir: "outputs/stage_1/backbone_text"
   log_file: "logs/train.log"
   csv: true
   csv_metrics_file: "csv/metrics.csv"
@@ -51,7 +50,7 @@ logging:
   wandb: true
   wandb_project: "hindi_llama_omni"
   wandb_run_id: null
-  wandb_run_name: "hindi-backbone-lora"
+  wandb_run_name: "stage-1-backbone-text"
   checkpoint_monitor: "val_loss"
   checkpoint_format: "safetensors"
   save_top_k: 1
