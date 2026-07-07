@@ -8,7 +8,7 @@ requirements.txt
 sample_data/
 whisper_downloader.py
 .gradio/
-data/
+
 checkpoints/
 experiments/
 indic.py
