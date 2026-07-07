@@ -12,7 +12,7 @@ whisper_downloader.py
 checkpoints/
 experiments/
 indic.py
-
+FINAL_REPORT.md
 logs/
 outputs/
 uv.lock
