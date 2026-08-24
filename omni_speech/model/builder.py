@@ -16,16 +16,14 @@
 #    limitations under the License.
 
 import os
-import warnings
-import shutil
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoConfig, BitsAndBytesConfig
 import torch
 from omni_speech.model import *
 from omni_speech.model.speech_encoder.builder import build_speech_encoder
 
 
-def load_pretrained_model(model_path, model_base, is_lora=False, s2s=False, load_8bit=False, load_4bit=False, device="cuda", use_flash_attn=False, **kwargs):
+def load_pretrained_model(model_path, model_base, is_lora=False, load_8bit=False, load_4bit=False, device="cuda", use_flash_attn=False, **kwargs):
     if load_8bit:
         kwargs['load_in_8bit'] = True
     elif load_4bit:
@@ -42,7 +40,7 @@ def load_pretrained_model(model_path, model_base, is_lora=False, s2s=False, load
     if use_flash_attn:
         kwargs['attn_implementation'] = 'flash_attention_2'
     
-    model_cls = OmniSpeech2SLlamaForCausalLM if s2s else OmniSpeechLlamaForCausalLM
+    model_cls = OmniSpeechLlamaForCausalLM
 
     # Load OmniSpeech model
     if is_lora:

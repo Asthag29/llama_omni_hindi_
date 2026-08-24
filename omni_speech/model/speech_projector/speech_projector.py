@@ -1,7 +1,6 @@
 # Adopted from https://github.com/ddlBoJack/SLAM-LLM/blob/main/src/slam_llm/models/projector.py
 #* nothing just a linear projection layer to match the embedding size of the llama model
 
-import torch
 import torch.nn as nn
 
 

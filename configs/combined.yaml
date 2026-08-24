@@ -13,8 +13,6 @@ data:
   num_workers: 4
   
 model:
-  name: "llama"
-  path: "models/llama"
   config_path: "models/llama"
   model_base: "models/llama"
   tokenizer_path: "models/llama"

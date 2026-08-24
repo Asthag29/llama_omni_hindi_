@@ -202,21 +202,9 @@ def preprocess(
     has_speech: bool = False
 ) -> Dict:
     """
-    Given a list of sources, each is a conversation list. This transform:
-    1. Add signal '### ' at the beginning each sentence, with end signal '\n';
-    2. Concatenate conversations together;
-    3. Tokenize the concatenated conversation;
-    4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
+    Preprocess conversations using the project's LLaMA-3 template.
     """
-    if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
-        return preprocess_plain(sources, tokenizer)
-    if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
-        return preprocess_llama_2(sources, tokenizer, has_speech=has_speech)
-    if conversation_lib.default_conversation.version.startswith("v1"):
-        return preprocess_v1(sources, tokenizer, has_speech=has_speech)
-    if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_3:
-        return preprocess_llama_3(sources, tokenizer, has_speech=has_speech)
-    raise NotImplementedError
+    return preprocess_llama_3(sources, tokenizer, has_speech=has_speech)
 
 
 if __name__ == "__main__":

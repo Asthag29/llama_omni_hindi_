@@ -1,9 +1,9 @@
 # Adopted from https://github.com/ddlBoJack/SLAM-LLM/blob/main/src/slam_llm/models/encoder.py
 
-import types
-import torch
+import os
+from pathlib import Path
+
 import torch.nn as nn
-import torch.nn.functional as F
 #! we have only used encoder of the whisper model , which still produces audio tokens
 
 class WhisperWrappedEncoder:
@@ -23,7 +23,22 @@ class WhisperWrappedEncoder:
                     replace_layer_norm(child)
 
         import whisper
-        encoder = whisper.load_model(name=model_config.speech_encoder, device='cpu').encoder
+
+        model_name = str(model_config.speech_encoder)
+        model_path = Path(model_name).expanduser()
+        if model_path.is_file():
+            encoder = whisper.load_model(name=str(model_path), device="cpu").encoder
+        else:
+            repo_root = Path(__file__).resolve().parents[3]
+            download_root = os.environ.get(
+                "WHISPER_DOWNLOAD_ROOT",
+                str(repo_root / "models" / "speech_encoder"),
+            )
+            encoder = whisper.load_model(
+                name=model_name,
+                device="cpu",
+                download_root=download_root,
+            ).encoder
         replace_layer_norm(encoder)
         return encoder
 

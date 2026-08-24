@@ -2,6 +2,7 @@ import argparse
 import datetime
 import json
 import os
+import tempfile
 import time
 import torch
 import torchaudio
@@ -12,20 +13,17 @@ import requests
 import soundfile as sf
 
 from omni_speech.conversation import default_conversation, conv_templates
-from omni_speech.constants import LOGDIR
+from omni_speech.constants import DEFAULT_SPEECH_PROMPT, LOGDIR
 from omni_speech.train_utils import build_logger, server_error_msg
-from fairseq.models.text_to_speech.vocoder import CodeHiFiGANVocoder
+from omni_speech.model.speech_generator.speech_generator import IndicF5SpeechGenerator
 
 
 logger = build_logger("gradio_web_server", "gradio_web_server.log")
 
-vocoder = None
+speech_generator = None
+reference_asr_model = None
 
 headers = {"User-Agent": "LLaMA-Omni Client"}
-
-no_change_btn = gr.Button()
-enable_btn = gr.Button(interactive=True)
-disable_btn = gr.Button(interactive=False)
 
 
 def get_conv_log_filename():
@@ -83,10 +81,66 @@ def clear_history(request: gr.Request):
     return (state, None, "", "", None)
 
 
+def normalize_audio(audio):
+    audio = np.asarray(audio)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=-1)
+    if np.issubdtype(audio.dtype, np.integer):
+        audio = audio.astype(np.float32) / np.iinfo(audio.dtype).max
+    else:
+        audio = audio.astype(np.float32)
+        peak = np.max(np.abs(audio)) if audio.size else 0.0
+        if peak > 1.0:
+            audio = audio / 32768.0
+    return audio
+
+
+def write_reference_audio(sample_rate, audio):
+    os.makedirs(LOGDIR, exist_ok=True)
+    audio = normalize_audio(audio)
+    with tempfile.NamedTemporaryFile(prefix="indicf5_ref_", suffix=".wav", dir=LOGDIR, delete=False) as ref_file:
+        sf.write(ref_file.name, audio, sample_rate)
+        return ref_file.name
+
+
+def get_reference_asr_model():
+    global reference_asr_model
+    if reference_asr_model is None:
+        import whisper
+
+        reference_asr_model = whisper.load_model(
+            args.reference_asr_model,
+            download_root=args.reference_asr_download_root,
+        )
+    return reference_asr_model
+
+
+def transcribe_reference_audio(ref_audio_path):
+    if args.reference_text:
+        return args.reference_text
+    if args.disable_reference_asr:
+        return ""
+
+    result = get_reference_asr_model().transcribe(
+        ref_audio_path,
+        language=args.reference_language,
+        fp16=torch.cuda.is_available(),
+    )
+    return result.get("text", "").strip()
+
+
+def synthesize_with_indicf5(text, ref_audio_path, ref_text):
+    if speech_generator is None:
+        return None
+    try:
+        return speech_generator.synthesize(text, ref_audio_path, ref_text)
+    except Exception as exc:
+        logger.exception(f"IndicF5 synthesis failed: {exc}")
+        return None
+
+
 def add_speech(state, speech, request: gr.Request):
-    text = "Please directly answer the questions in the user's speech."
-    text = '<speech>\n' + text
-    text = (text, speech)
+    text = (DEFAULT_SPEECH_PROMPT, speech)
     state = default_conversation.copy()
     state.append_message(state.roles[0], text)
     state.append_message(state.roles[1], None)
@@ -94,7 +148,7 @@ def add_speech(state, speech, request: gr.Request):
     return (state)
 
 
-def http_bot(state, model_selector, temperature, top_p, max_new_tokens, chunk_size, request: gr.Request):
+def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request: gr.Request):
     logger.info(f"http_bot. ip: {request.client.host}")
     start_tstamp = time.time()
     model_name = model_selector
@@ -129,10 +183,14 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, chunk_si
     prompt = state.get_prompt()
 
     sr, audio = state.messages[0][1][1]
+    ref_audio_path = write_reference_audio(sr, audio)
+    ref_text = transcribe_reference_audio(ref_audio_path) if speech_generator is not None else ""
+    if speech_generator is not None:
+        logger.info(f"IndicF5 reference transcript: {ref_text}")
+
     resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
-    audio = torch.tensor(audio.astype(np.float32)).unsqueeze(0)
+    audio = torch.tensor(normalize_audio(audio)).unsqueeze(0)
     audio = resampler(audio).squeeze(0).numpy()
-    audio /= 32768.0
     audio = audio.tolist()
     # Make requests
     pload = {
@@ -153,31 +211,15 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, chunk_si
         # Stream output
         response = requests.post(worker_addr + "/worker_generate_stream",
             headers=headers, json=pload, stream=True, timeout=10)
-        num_generated_units = 0
-        wav_list = []
+        output = ""
         for chunk in response.iter_lines(decode_unicode=False, delimiter=b"\0"):
             if chunk:
                 data = json.loads(chunk.decode())
                 if data["error_code"] == 0:
                     output = data["text"][len(prompt):].strip()
-                    output_unit = list(map(int, data["unit"].strip().split()))
-                    state.messages[-1][-1] = (output, data["unit"].strip())
+                    state.messages[-1][-1] = output
 
-                    # vocoder
-                    new_units = output_unit[num_generated_units:]
-                    if len(new_units) >= chunk_size:
-                        num_generated_units = len(output_unit)
-                        x = {"code": torch.LongTensor(new_units).view(1, -1).cuda()}
-                        wav = vocoder(x, True)
-                        wav_list.append(wav.detach().cpu().numpy())
-
-                    if len(wav_list) > 0:
-                        wav_full = np.concatenate(wav_list)
-                        return_value = (16000, wav_full)
-                    else:
-                        return_value = None
-
-                    yield (state, state.messages[-1][-1][0], state.messages[-1][-1][1], return_value)
+                    yield (state, output, ref_text, None)
                 else:
                     output = data["text"] + f" (error_code: {data['error_code']})"
                     state.messages[-1][-1] = output
@@ -189,26 +231,12 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, chunk_si
         yield (state, "", "", None)
         return
 
-    if num_generated_units < len(output_unit):
-        new_units = output_unit[num_generated_units:]
-        num_generated_units = len(output_unit)
-        x = {
-            "code": torch.LongTensor(new_units).view(1, -1).cuda()
-        }
-        wav = vocoder(x, True)
-        wav_list.append(wav.detach().cpu().numpy())
-    
-    if len(wav_list) > 0:
-        wav_full = np.concatenate(wav_list)
-        return_value = (16000, wav_full)
-    else:
-        return_value = None
-
-    yield (state, state.messages[-1][-1][0], state.messages[-1][-1][1], return_value)
+    return_value = synthesize_with_indicf5(output, ref_audio_path, ref_text)
+    yield (state, output, ref_text, return_value)
 
     finish_tstamp = time.time()
     logger.info(f"{output}")
-    logger.info(f"{output_unit}")
+    logger.info(f"IndicF5 reference transcript: {ref_text}")
 
 
 title_markdown = ("""
@@ -223,7 +251,7 @@ block_css = """
 
 """
 
-def build_demo(embed_mode, vocoder, cur_dir=None, concurrency_count=10):
+def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
     with gr.Blocks(title="LLaMA-Omni Speech Chatbot", theme=gr.themes.Default(), css=block_css) as demo:
         state = gr.State()
 
@@ -244,7 +272,6 @@ def build_demo(embed_mode, vocoder, cur_dir=None, concurrency_count=10):
                 temperature = gr.Slider(minimum=0.0, maximum=1.0, value=0.0, step=0.1, interactive=True, label="Temperature",)
                 top_p = gr.Slider(minimum=0.0, maximum=1.0, value=0.7, step=0.1, interactive=True, label="Top P",)
                 max_output_tokens = gr.Slider(minimum=0, maximum=1024, value=512, step=64, interactive=True, label="Max Output Tokens",)
-                chunk_size = gr.Slider(minimum=10, maximum=500, value=40, step=10, interactive=True, label="Chunk Size",)
 
         if cur_dir is None:
             cur_dir = os.path.dirname(os.path.abspath(__file__))
@@ -266,7 +293,7 @@ def build_demo(embed_mode, vocoder, cur_dir=None, concurrency_count=10):
             clear_btn = gr.Button(value="Clear")
 
         text_output_box = gr.Textbox(label="Text Output", type="text")
-        unit_output_box = gr.Textbox(label="Unit Output", type="text") 
+        reference_text_box = gr.Textbox(label="Reference Transcript", type="text")
         audio_output_box = gr.Audio(label="Speech Output")
 
         url_params = gr.JSON(visible=False)
@@ -277,15 +304,15 @@ def build_demo(embed_mode, vocoder, cur_dir=None, concurrency_count=10):
             [state]
         ).then(
             http_bot,
-            [state, model_selector, temperature, top_p, max_output_tokens, chunk_size],
-            [state, text_output_box, unit_output_box, audio_output_box],
+            [state, model_selector, temperature, top_p, max_output_tokens],
+            [state, text_output_box, reference_text_box, audio_output_box],
             concurrency_limit=concurrency_count
         )
 
         clear_btn.click(
             clear_history,
             None,
-            [state, audio_input_box, text_output_box, unit_output_box, audio_output_box],
+            [state, audio_input_box, text_output_box, reference_text_box, audio_output_box],
             queue=False
         )
 
@@ -309,13 +336,13 @@ def build_demo(embed_mode, vocoder, cur_dir=None, concurrency_count=10):
     return demo
 
 
-def build_vocoder(args):
-    global vocoder
-    if args.vocoder is None:
-        return None
-    with open(args.vocoder_cfg) as f:
-        vocoder_cfg = json.load(f)
-    vocoder = CodeHiFiGANVocoder(args.vocoder, vocoder_cfg).cuda()
+def build_speech_output_backend(args):
+    global speech_generator
+    speech_generator = IndicF5SpeechGenerator(
+        model_path=args.indicf5_model_path,
+        repo_id=args.indicf5_repo_id,
+        device=args.indicf5_device,
+    )
 
 
 if __name__ == "__main__":
@@ -329,16 +356,22 @@ if __name__ == "__main__":
     parser.add_argument("--share", action="store_true")
     parser.add_argument("--moderate", action="store_true")
     parser.add_argument("--embed", action="store_true")
-    parser.add_argument("--vocoder", type=str)
-    parser.add_argument("--vocoder-cfg", type=str)
+    parser.add_argument("--indicf5-model-path", type=str, default="models/indicf5")
+    parser.add_argument("--indicf5-repo-id", type=str, default="ai4bharat/IndicF5")
+    parser.add_argument("--indicf5-device", type=str, default=None)
+    parser.add_argument("--reference-asr-model", type=str, default="large-v3")
+    parser.add_argument("--reference-asr-download-root", type=str, default="models/speech_encoder")
+    parser.add_argument("--reference-language", type=str, default="hi")
+    parser.add_argument("--reference-text", type=str, default="")
+    parser.add_argument("--disable-reference-asr", action="store_true")
     args = parser.parse_args()
     logger.info(f"args: {args}")
 
     models = get_model_list()
-    build_vocoder(args)
+    build_speech_output_backend(args)
 
     logger.info(args)
-    demo = build_demo(args.embed, vocoder, concurrency_count=args.concurrency_count)
+    demo = build_demo(args.embed, concurrency_count=args.concurrency_count)
     demo.queue(
         api_open=False
     ).launch(

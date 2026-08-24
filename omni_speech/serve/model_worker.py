@@ -7,6 +7,7 @@ import json
 import time
 import threading
 import uuid
+from pathlib import Path
 
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
@@ -17,14 +18,12 @@ import whisper
 import numpy as np
 from functools import partial
 
-from transformers import PreTrainedTokenizer
-
 from omni_speech.constants import WORKER_HEART_BEAT_INTERVAL
 from omni_speech.train_utils import (build_logger, server_error_msg,
     pretty_print_semaphore)
 from omni_speech.model.builder import load_pretrained_model
-from omni_speech.constants import SPEECH_TOKEN_INDEX, DEFAULT_SPEECH_TOKEN
 from omni_speech.datasets.preprocess import tokenizer_speech_token
+from omni_speech.infer.inference import load_inference_cfg, load_module_from_checkpoint
 from transformers import TextIteratorStreamer
 from threading import Thread
 
@@ -57,22 +56,12 @@ def load_speech(audio, input_type, mel_size, speech_normalize):
     return speech
 
 
-def build_unit_tokenizer(vocab_size):
-    import os
-    from transformers import BertTokenizer
-    with open("unit_vocab.txt", "w") as f:
-        for i in range(vocab_size + 1):
-            f.write(str(i) + "\n")
-    tokenizer = BertTokenizer(vocab_file="unit_vocab.txt")
-    os.remove("unit_vocab.txt")
-    return tokenizer
-
-
 class ModelWorker:
     def __init__(self, controller_addr, worker_addr,
                  worker_id, no_register,
                  model_path, model_base, model_name,
-                 load_8bit, load_4bit, device, input_type, mel_size, s2s, is_lora, use_flash_attn=False):
+                 load_8bit, load_4bit, device, input_type, mel_size, is_lora,
+                 checkpoint_path=None, config_path=None, use_flash_attn=False):
         self.controller_addr = controller_addr
         self.worker_addr = worker_addr
         self.worker_id = worker_id
@@ -80,9 +69,23 @@ class ModelWorker:
         self.model_name = model_name
         self.input_type = input_type
         self.mel_size = mel_size
-        self.tokenizer, self.model, self.context_len = load_pretrained_model(
-            model_path, model_base, is_lora=is_lora, s2s=s2s, load_8bit=load_8bit, load_4bit=load_4bit, device=self.device, use_flash_attn=use_flash_attn)
-        self.unit_tokenizer = build_unit_tokenizer(self.model.config.unit_vocab_size)
+        if checkpoint_path:
+            config_path = config_path or "configs/stage_2.yaml"
+            cfg = load_inference_cfg(Path(config_path).expanduser().resolve())
+            module, loaded_device = load_module_from_checkpoint(
+                Path(checkpoint_path).expanduser().resolve(),
+                cfg,
+                requested_device=self.device,
+            )
+            self.device = str(loaded_device)
+            self.tokenizer = module.tokenizer
+            self.model = module.model
+            self.context_len = getattr(self.model.config, "max_sequence_length", 2048)
+        else:
+            self.tokenizer, self.model, self.context_len = load_pretrained_model(
+                model_path, model_base, is_lora=is_lora, load_8bit=load_8bit,
+                load_4bit=load_4bit, device=self.device,
+                use_flash_attn=use_flash_attn)
 
         if not no_register:
             self.register_to_controller()
@@ -155,14 +158,12 @@ class ModelWorker:
 
         temperature = float(params.get("temperature", 1.0))
         top_p = float(params.get("top_p", 1.0))
-        max_context_length = getattr(model.config, 'max_position_embeddings', 2048)
         max_new_tokens = min(int(params.get("max_new_tokens", 256)), 1024)
         stop_str = params.get("stop", None)
         do_sample = True if temperature > 0.001 else False
 
         input_ids = tokenizer_speech_token(prompt, tokenizer, return_tensors='pt').unsqueeze(0).to(self.device)
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=15)
-        streamer_unit = TextIteratorStreamer(self.unit_tokenizer, skip_prompt=False, skip_special_tokens=True, timeout=15)
 
         # max_new_tokens = min(max_new_tokens, max_context_length - input_ids.shape[-1] - num_image_tokens)
 
@@ -177,8 +178,6 @@ class ModelWorker:
             top_p=top_p,
             max_new_tokens=max_new_tokens,
             streamer=streamer,
-            streamer_unit=streamer_unit,
-            streaming_unit_gen=True,
             use_cache=True,
             **speech_args
         ))
@@ -187,10 +186,9 @@ class ModelWorker:
         generated_text = ori_prompt
         for new_text in streamer:
             generated_text += new_text
-            generated_unit = " ".join(map(str, streamer_unit.token_cache))
-            if generated_text.endswith(stop_str):
+            if stop_str and generated_text.endswith(stop_str):
                 generated_text = generated_text[:-len(stop_str)]
-            yield json.dumps({"text": generated_text, "unit": generated_unit, "error_code": 0}).encode() + b"\0"
+            yield json.dumps({"text": generated_text, "error_code": 0}).encode() + b"\0"
 
     def generate_stream_gate(self, params):
         try:
@@ -269,7 +267,6 @@ if __name__ == "__main__":
     parser.add_argument("--use-flash-attn", action="store_true")
     parser.add_argument("--input-type", type=str, default="mel")
     parser.add_argument("--mel-size", type=int, default=128)
-    parser.add_argument("--s2s", action="store_true", default=False)
     parser.add_argument("--is-lora", action="store_true", default=False)
     args = parser.parse_args()
     logger.info(f"args: {args}")
@@ -286,7 +283,6 @@ if __name__ == "__main__":
                          args.device,
                          args.input_type,
                          args.mel_size,
-                         args.s2s,
                          args.is_lora,
                          use_flash_attn=args.use_flash_attn)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

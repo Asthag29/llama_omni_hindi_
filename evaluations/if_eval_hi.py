@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-path", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--batch-size", default="16", help="lm-eval batch size. Use a smaller value if generation runs out of memory.")
     parser.add_argument("--limit", type=int, default=None, help="Optional smoke-test sample limit.")
-    parser.add_argument("--max-gen-toks", type=int, default=512, help="Maximum new tokens generated per IFEval-Hi prompt.")
+    parser.add_argument("--max-gen-toks", type=int, default=2048, help="Maximum new tokens generated per IFEval-Hi prompt.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16")
     return parser.parse_args()

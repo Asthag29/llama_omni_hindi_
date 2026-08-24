@@ -1,5 +1,4 @@
 data:
-  path: "data"
   seed: 42
   input_type: "mel"
   mel_size: 128
@@ -11,8 +10,6 @@ data:
   compute_mel_on_gpu: false
 
 model:
-  name: "llama"
-  path: "models/llama"
   config_path: "models/llama"
   model_base: "models/llama"
   tokenizer_path: "models/llama"

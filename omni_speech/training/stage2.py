@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from transformers import get_cosine_schedule_with_warmup
 
 from omni_speech.datasets.preprocess import preprocess, preprocess_multimodal
-from omni_speech.trainer_combined import OmniSpeechTrainingModule, SpeechCollator
+from omni_speech.training.combined import OmniSpeechTrainingModule, SpeechCollator
 from omni_speech.train_utils import (
     build_callbacks,
     build_loggers,
@@ -90,7 +90,7 @@ def _load_streaming_dataset(data_files: list[str], split_name: str, cache_dir: s
     except ImportError as exc:
         raise ImportError(
             "HF streaming training requires the `datasets` package. "
-            "Install it in the environment before running trainer_stage_2.py."
+            "Install it in the environment before running stage2.py."
         ) from exc
 
     dataset = load_dataset(
@@ -462,7 +462,7 @@ class HFStreamingTrainingModule(OmniSpeechTrainingModule):
         }
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="stage_2")
+@hydra.main(version_base=None, config_path="../../configs", config_name="stage_2")
 def main(cfg: DictConfig):
     pl.seed_everything(int(cfg.data.seed), workers=True)
 

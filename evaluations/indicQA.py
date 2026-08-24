@@ -515,7 +515,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="Optional number of examples to evaluate. Defaults to all.")
     parser.add_argument("--max-input-tokens", type=int, default=2048, help="Skip rows where context+question prompt exceeds this token length.")
     parser.add_argument("--max-new-tokens", type=int, default=32, help="Maximum generated answer tokens for EM/F1 scoring.")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size for model forward/generation calls.")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size for model forward/generation calls.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--output", default=str(REPO_ROOT / "evaluations" / "results" / "indicqa.json"))
     parser.add_argument("--skip-bertscore", action="store_true", help="Skip BERTScore calculation.")

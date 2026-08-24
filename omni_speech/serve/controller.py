@@ -3,13 +3,11 @@ A controller manages distributed workers.
 It sends worker addresses to clients.
 """
 import argparse
-import asyncio
 import dataclasses
 from enum import Enum, auto
 import json
-import logging
 import time
-from typing import List, Union
+from typing import List
 import threading
 
 from fastapi import FastAPI, Request
@@ -199,6 +197,7 @@ class Controller:
                 "error_code": 2,
             }
             yield json.dumps(ret).encode() + b"\0"
+            return
 
         try:
             response = requests.post(worker_addr + "/worker_generate_stream",
@@ -249,7 +248,7 @@ async def register_worker(request: Request):
 
 @app.post("/refresh_all_workers")
 async def refresh_all_workers():
-    models = controller.refresh_all_workers()
+    controller.refresh_all_workers()
 
 
 @app.post("/list_models")

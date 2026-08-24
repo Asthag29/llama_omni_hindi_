@@ -120,8 +120,13 @@ class OmniSpeechLlamaForCausalLM(LlamaForCausalLM, OmniSpeechMetaForCausalLM):
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
+        input_ids = kwargs.pop("input_ids", None)
+        if inputs is None:
+            inputs = input_ids
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
+        if inputs is None:
+            raise ValueError("`inputs` or `input_ids` must be provided for generation.")
 
         if speech is not None:
             (

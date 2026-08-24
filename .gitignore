@@ -4,9 +4,7 @@ models/
 vocoder/
 experiment.ipynb
 My_learning.md
-requirements.txt
 sample_data/
-whisper_downloader.py
 .gradio/
 
 checkpoints/
@@ -19,8 +17,6 @@ uv.lock
 
 delete_folder/
 
-*.sh
-*.sbatch
 .cache/
 .ipynb_checkpoints/
 .uv-cache/
@@ -33,3 +29,9 @@ __pycache__/
 # Generated evaluation outputs.
 evaluations/results/*.json
 !evaluations/results/speech_streaming_validation.json
+
+scripts/
+shortcuts.sh
+new.md
+
+audio/

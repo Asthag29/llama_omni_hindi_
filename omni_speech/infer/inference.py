@@ -15,13 +15,14 @@ import torchaudio
 import whisper
 from omegaconf import OmegaConf
 
-REPO_ROOT = Path("/dss/dsshome1/0C/ra85muk2/Desktop/Programming/hindi_llama_omni")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from omni_speech.conversation import conv_templates
+from omni_speech.constants import DEFAULT_SPEECH_PROMPT
 from omni_speech.datasets.preprocess import tokenizer_speech_token
-from omni_speech.trainer_combined import OmniSpeechTrainingModule
+from omni_speech.training.combined import OmniSpeechTrainingModule
 from omni_speech.train_utils import (
     is_safetensors_checkpoint,
     load_omni_speech_checkpoint,
@@ -39,12 +40,7 @@ CHECKPOINT_PATH = None
 STREAMING_RUN_ID = "speech_text"
 
 CONV_MODE = "llama_3"
-DEFAULT_PROMPT = (
-    "<speech>\n"
-    "आप हिंदी लामा मॉडल हैं। उपयोगकर्ता की आवाज़ सुनें और उनके प्रश्न का उत्तर हिंदी "
-    "(देवनागरी लिपि) में दें। "
-    "Roman/Latin अक्षरों (Hinglish) का उपयोग न करें।"
-)
+DEFAULT_PROMPT = DEFAULT_SPEECH_PROMPT
 
 MAX_NEW_TOKENS = 256
 TEMPERATURE = 0.0
@@ -128,7 +124,6 @@ def load_inference_cfg(config_path: Path):
     if "hydra" in cfg:
         del cfg["hydra"]
 
-    cfg.model.path = str((REPO_ROOT / cfg.model.path).resolve())
     cfg.model.config_path = str((REPO_ROOT / cfg.model.config_path).resolve())
     cfg.model.model_base = str((REPO_ROOT / cfg.model.model_base).resolve())
     cfg.model.tokenizer_path = str((REPO_ROOT / cfg.model.tokenizer_path).resolve())
@@ -145,9 +140,15 @@ def load_inference_cfg(config_path: Path):
     return cfg
 
 
-def load_module_from_checkpoint(checkpoint_path: Path, cfg):
+def load_module_from_checkpoint(
+    checkpoint_path: Path,
+    cfg,
+    requested_device: str | torch.device | None = None,
+):
     checkpoint_path = Path(resolve_checkpoint_path(str(checkpoint_path)))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requested_device is None or str(requested_device) == "auto":
+        requested_device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(requested_device)
 
     print(f"Loading model on {device}...")
     module = OmniSpeechTrainingModule(cfg)

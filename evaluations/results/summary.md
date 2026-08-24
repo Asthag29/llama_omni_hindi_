@@ -2,6 +2,20 @@
 
 This report compares the original/base backbone against the fine-tuned model. 
 
+## Reproducing Evaluations
+
+
+Run the scripts directly from an activated environment:
+
+```bash
+python evaluations/indicQA.py
+python evaluations/mt_bench_hi.py
+python evaluations/if_eval_hi.py
+python evaluations/gsm8k_hi.py
+```
+
+The scripts write result files under `evaluations/results/`.
+
 ## IndicQA
 
 IndicQA measures context-grounded Hindi question answering. In this evaluation, the fine-tuned model improves every answer-quality metric over the base model.
