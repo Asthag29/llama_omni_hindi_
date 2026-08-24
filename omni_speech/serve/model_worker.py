@@ -150,7 +150,8 @@ class ModelWorker:
         if audio is not None and len(audio) > 0:
             speech = load_speech(audio, self.input_type, self.mel_size, self.model.config.speech_normalize)
             speech_length = torch.LongTensor([speech.shape[0]]).unsqueeze(0).to(self.device)
-            speech_tensor = speech.unsqueeze(0).to(self.device, dtype=torch.float16)
+            speech_dtype = torch.float16 if self.device.startswith("cuda") else torch.float32
+            speech_tensor = speech.unsqueeze(0).to(self.device, dtype=speech_dtype)
             speech_args = {"speech": speech_tensor, "speech_lengths": speech_length}
         else:
             speech = None
@@ -259,6 +260,8 @@ if __name__ == "__main__":
     parser.add_argument("--model-base", type=str, default=None)
     parser.add_argument("--model-name", type=str)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--limit-model-concurrency", type=int, default=5)
     parser.add_argument("--stream-interval", type=int, default=1)
     parser.add_argument("--no-register", action="store_true")
@@ -284,5 +287,7 @@ if __name__ == "__main__":
                          args.input_type,
                          args.mel_size,
                          args.is_lora,
+                         checkpoint_path=args.checkpoint,
+                         config_path=args.config,
                          use_flash_attn=args.use_flash_attn)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

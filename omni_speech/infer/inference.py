@@ -35,7 +35,7 @@ CONFIG_PATH = REPO_ROOT / "configs" / "stage_2.yaml"
 
 # Leave CHECKPOINT_PATH as None to auto-pick the latest streaming-trainer checkpoint.
 # Default run written by stage-2 streaming training:
-# outputs/stage_2/speech_text/checkpoints/last
+# models/hindi_ckpt/stage_2/speech_text/checkpoints/last
 CHECKPOINT_PATH = None
 STREAMING_RUN_ID = "speech_text"
 
@@ -83,14 +83,22 @@ def find_streaming_checkpoint(
 
     candidates = []
     run_roots = []
-    streaming_root = REPO_ROOT / "outputs" / "stage_2"
-    configured_root = REPO_ROOT / "outputs" / "stage_2" / "speech_text"
+    streaming_roots = [
+        REPO_ROOT / "models" / "hindi_ckpt" / "stage_2",
+        REPO_ROOT / "outputs" / "stage_2",
+    ]
+    configured_roots = [
+        REPO_ROOT / "models" / "hindi_ckpt" / "stage_2" / "speech_text",
+        REPO_ROOT / "outputs" / "stage_2" / "speech_text",
+    ]
 
     if streaming_run_id:
-        run_roots.append(streaming_root / streaming_run_id)
-    elif streaming_root.is_dir():
-        run_roots.extend(sorted(path for path in streaming_root.iterdir() if path.is_dir()))
-    run_roots.append(configured_root)
+        run_roots.extend(root / streaming_run_id for root in streaming_roots)
+    else:
+        for root in streaming_roots:
+            if root.is_dir():
+                run_roots.extend(sorted(path for path in root.iterdir() if path.is_dir()))
+    run_roots.extend(configured_roots)
 
     seen = set()
     fallback_candidates = []
@@ -113,7 +121,7 @@ def find_streaming_checkpoint(
     if not candidates:
         raise FileNotFoundError(
             "No streaming safetensors checkpoint found. Set --checkpoint manually, "
-            "for example outputs/stage_2/<run_id>/checkpoints/last."
+            "for example models/hindi_ckpt/stage_2/<run_id>/checkpoints/last."
         )
 
     return sorted(set(candidates), key=checkpoint_sort_key)[0]
