@@ -17,7 +17,7 @@ dependencies = [
     "torch==2.1.2", "torchvision==0.16.2", "torchaudio==2.1.2",
     "transformers==4.43.4", "tokenizers==0.19.1", "sentencepiece==0.1.99", "shortuuid",
     "accelerate==0.33.0", "peft==0.11.1",
-    "pydantic", "markdown2[all]", "numpy", "scikit-learn==1.2.2",
+    "pydantic==2.8.2", "markdown2[all]", "numpy", "scikit-learn==1.2.2",
     "PyYAML>=6.0", "pillow>=10.0.0",
     "gradio==4.43.0", "gradio_client==1.3.0",
     "requests", "httpx==0.27.2", "uvicorn", "fastapi", "soundfile",

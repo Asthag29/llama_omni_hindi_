@@ -38,24 +38,27 @@ The text instruction mixture includes AI4Bharat Indic-Instruct style sources suc
 
 ## ⚖️ License and attribution
 
-The upstream LLaMA-Omni weights in this bundle are released for academic,
-non-commercial use only. Follow the upstream [model terms](https://huggingface.co/ICTNLP/Llama-3.1-8B-Omni)
-and cite the original [LLaMA-Omni paper](https://arxiv.org/abs/2409.06666).
-The Hindi adapter is provided for research use with the same restriction.
-IndicF5 and Whisper retain their respective upstream licenses.
+The Hindi stage-2 adapter is published at
+[`Pastaaaaa2003/hindi-llama-omni-model`](https://huggingface.co/Pastaaaaa2003/hindi-llama-omni-model).
+The base LLaMA-Omni, Whisper, and IndicF5 checkpoints must be downloaded from
+their upstream repositories. Follow their respective terms, including the
+academic, non-commercial restriction for
+[LLaMA-Omni](https://huggingface.co/ICTNLP/Llama-3.1-8B-Omni), and cite the
+original [LLaMA-Omni paper](https://arxiv.org/abs/2409.06666).
 
 ## 🛠️ Install
 
-The supported runtime is Linux with an NVIDIA GPU and CUDA 12.1. The complete
-model bundle is approximately 20 GB, so keep at least 25 GB free disk space.
-Apple Silicon is not currently a supported runtime for the Gradio server.
+The supported runtime is Linux with an NVIDIA GPU and CUDA 12.1. Keep at least
+25 GB free disk space. Apple Silicon is not currently a supported runtime for
+the Gradio server.
 
 #### 1. Install prerequisites
 
-Install Python 3.11.14, Git, and `uv`. For Linux, install a CUDA driver
-compatible with CUDA 12.1.
+Install Python 3.11.14, Git, `ffmpeg`, and `uv`. For Linux, install an NVIDIA
+driver compatible with CUDA 12.1.
 
 ```bash
+sudo apt-get update && sudo apt-get install -y ffmpeg git
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
@@ -83,25 +86,63 @@ uv pip install torch==2.1.2+cu121 torchvision==0.16.2+cu121 torchaudio==2.1.2+cu
 ```bash
 uv pip install -r requirements.txt
 uv pip install -e .
-uv pip install "f5_tts @ git+https://github.com/AI4Bharat/IndicF5.git"
+uv pip install "f5_tts @ git+https://github.com/AI4Bharat/IndicF5.git@13f7c4d627cc10111aea8fe9c0039462cacacdc7"
 ```
 
-## ⚡ Download the complete model bundle
+## ⚡ Download model checkpoints
 
-The Hindi checkpoint and its required base models are published in one
-Hugging Face repository. Download the bundle from the project root; do not
-download it into `models/llama`, because the repository contains all required
-subdirectories.
+All model checkpoints must be stored under the repository's `models/`
+directory. Run these commands from the repository root.
+
+### 1. Download the LLaMA-Omni base model
+
+```bash
+hf download ICTNLP/Llama-3.1-8B-Omni \
+  --revision 4844429b4f81bc9cd93dcf5b1f0c66b8925fbab8 \
+  --local-dir models/llama
+```
+
+### 2. Download the verified Whisper large-v3 encoder
+
+```bash
+rm -f models/speech_encoder/large-v3.pt
+python omni_speech/datasets/downloader/whisper_downloader.py
+sha256sum models/speech_encoder/large-v3.pt
+```
+
+The printed SHA-256 must be:
+
+```text
+e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb
+```
+
+### 3. Request access to and download IndicF5
+
+Open [ai4bharat/IndicF5](https://huggingface.co/ai4bharat/IndicF5), request
+access, then authenticate with the Hugging Face account that was approved.
+
+```bash
+hf auth login
+hf download ai4bharat/IndicF5 \
+  --revision ba85abedf18dc479a447eaa0eccbd76ab78a47d5 \
+  --local-dir models/indicf5
+```
+
+IndicF5 can download additional dependencies, including Vocos, when first
+used. Keep the Hugging Face credentials available for that first synthesis.
+
+### 4. Download the Hindi stage-2 adapter
 
 ```bash
 hf download Pastaaaaa2003/hindi-llama-omni-model \
-  --repo-type model \
-  --local-dir . \
-  --exclude README.md images/*
+  --include "models/hindi_ckpt/stage_2/**" \
+  --local-dir .
 ```
 
-The download is approximately 20 GB and may take several minutes. The
-resulting layout must be:
+Only the final stage-2 adapter is required for inference; stage-1 checkpoints
+are training artifacts and are not distributed.
+
+The resulting layout must be:
 
 ```text
 models/
@@ -109,8 +150,7 @@ models/
 ├── speech_encoder/   # Whisper large-v3 weights
 ├── indicf5/          # IndicF5 model snapshot
 └── hindi_ckpt/
-    ├── stage_1/      # Hindi stage-1 checkpoint
-    └── stage_2/      # Hindi stage-2 checkpoint
+    └── stage_2/      # Hindi stage-2 inference checkpoint
         └── speech_text/
             └── checkpoints/
                 └── last/  # adapter and speech projector
@@ -161,23 +201,27 @@ python -m omni_speech.serve.gradio_web_server \
   --host 127.0.0.1 \
   --port 7860 \
   --controller-url http://127.0.0.1:21001 \
-  --indicf5-model-path models/indicf5 \
-  --reference-asr-download-root models/speech_encoder \
-  --reference-language hi
+  --indicf5-model-path models/indicf5
 ```
 
 Open <http://127.0.0.1:7860/> and record or upload a Hindi speech question.
-The same audio is used as the reference voice for IndicF5 synthesis.
+The demo returns a Hindi audio answer using `data/inference.wav` as the fixed
+IndicF5 reference voice. Its fixed reference transcript is `तुम कौन हो`;
+Whisper is not used to transcribe reference audio.
 
-## 🧪 Text-only local inference
+## 🧪 Speech-input text-response test
 
-To test response generation without starting the web server:
+This command tests the speech-understanding and Hindi-text generation stages
+without starting the web server. It prints the Hindi response in the terminal;
+use the Gradio demo above for the complete speech-to-speech response.
 
 ```bash
 python -m omni_speech.infer.inference \
   --audio path/to/hindi-question.wav \
   --checkpoint models/hindi_ckpt/stage_2/speech_text/checkpoints/last
 ```
+
+The tracked `data/inference.wav` file can be used as the default test audio.
 
 ## 📊 Evaluation
 

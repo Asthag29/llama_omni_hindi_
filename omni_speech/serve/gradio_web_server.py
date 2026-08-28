@@ -2,15 +2,15 @@ import argparse
 import datetime
 import json
 import os
-import tempfile
 import time
+from pathlib import Path
+
 import torch
 import torchaudio
 
 import gradio as gr
 import numpy as np
 import requests
-import soundfile as sf
 
 from omni_speech.conversation import default_conversation, conv_templates
 from omni_speech.constants import DEFAULT_SPEECH_PROMPT, LOGDIR
@@ -21,7 +21,9 @@ from omni_speech.model.speech_generator.speech_generator import IndicF5SpeechGen
 logger = build_logger("gradio_web_server", "gradio_web_server.log")
 
 speech_generator = None
-reference_asr_model = None
+
+DEFAULT_REFERENCE_AUDIO = Path(__file__).resolve().parents[2] / "data" / "inference.wav"
+DEFAULT_REFERENCE_TEXT = "तुम कौन हो"
 
 headers = {"User-Agent": "LLaMA-Omni Client"}
 
@@ -78,7 +80,7 @@ def load_demo_refresh_model_list(request: gr.Request):
 def clear_history(request: gr.Request):
     logger.info(f"clear_history. ip: {request.client.host}")
     state = default_conversation.copy()
-    return (state, None, "", "", None)
+    return (state, None, "", DEFAULT_REFERENCE_TEXT, None)
 
 
 def normalize_audio(audio):
@@ -95,38 +97,12 @@ def normalize_audio(audio):
     return audio
 
 
-def write_reference_audio(sample_rate, audio):
-    os.makedirs(LOGDIR, exist_ok=True)
-    audio = normalize_audio(audio)
-    with tempfile.NamedTemporaryFile(prefix="indicf5_ref_", suffix=".wav", dir=LOGDIR, delete=False) as ref_file:
-        sf.write(ref_file.name, audio, sample_rate)
-        return ref_file.name
-
-
-def get_reference_asr_model():
-    global reference_asr_model
-    if reference_asr_model is None:
-        import whisper
-
-        reference_asr_model = whisper.load_model(
-            args.reference_asr_model,
-            download_root=args.reference_asr_download_root,
+def get_default_reference() -> tuple[str, str]:
+    if not DEFAULT_REFERENCE_AUDIO.is_file():
+        raise FileNotFoundError(
+            f"IndicF5 reference audio is missing: {DEFAULT_REFERENCE_AUDIO}"
         )
-    return reference_asr_model
-
-
-def transcribe_reference_audio(ref_audio_path):
-    if args.reference_text:
-        return args.reference_text
-    if args.disable_reference_asr:
-        return ""
-
-    result = get_reference_asr_model().transcribe(
-        ref_audio_path,
-        language=args.reference_language,
-        fp16=torch.cuda.is_available(),
-    )
-    return result.get("text", "").strip()
+    return str(DEFAULT_REFERENCE_AUDIO), DEFAULT_REFERENCE_TEXT
 
 
 def synthesize_with_indicf5(text, ref_audio_path, ref_text):
@@ -183,10 +159,11 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request:
     prompt = state.get_prompt()
 
     sr, audio = state.messages[0][1][1]
-    ref_audio_path = write_reference_audio(sr, audio)
-    ref_text = transcribe_reference_audio(ref_audio_path) if speech_generator is not None else ""
     if speech_generator is not None:
-        logger.info(f"IndicF5 reference transcript: {ref_text}")
+        ref_audio_path, ref_text = get_default_reference()
+        logger.info(f"Using IndicF5 default reference: {ref_audio_path}")
+    else:
+        ref_audio_path, ref_text = None, ""
 
     resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
     audio = torch.tensor(normalize_audio(audio)).unsqueeze(0)
@@ -293,7 +270,12 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
             clear_btn = gr.Button(value="Clear")
 
         text_output_box = gr.Textbox(label="Text Output", type="text")
-        reference_text_box = gr.Textbox(label="Reference Transcript", type="text")
+        reference_text_box = gr.Textbox(
+            label="Default Reference Transcript",
+            value=DEFAULT_REFERENCE_TEXT,
+            interactive=False,
+            type="text",
+        )
         audio_output_box = gr.Audio(label="Speech Output")
 
         url_params = gr.JSON(visible=False)
@@ -338,6 +320,7 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
 
 def build_speech_output_backend(args):
     global speech_generator
+    get_default_reference()
     speech_generator = IndicF5SpeechGenerator(
         model_path=args.indicf5_model_path,
         repo_id=args.indicf5_repo_id,
@@ -359,11 +342,6 @@ if __name__ == "__main__":
     parser.add_argument("--indicf5-model-path", type=str, default="models/indicf5")
     parser.add_argument("--indicf5-repo-id", type=str, default="ai4bharat/IndicF5")
     parser.add_argument("--indicf5-device", type=str, default=None)
-    parser.add_argument("--reference-asr-model", type=str, default="large-v3")
-    parser.add_argument("--reference-asr-download-root", type=str, default="models/speech_encoder")
-    parser.add_argument("--reference-language", type=str, default="hi")
-    parser.add_argument("--reference-text", type=str, default="")
-    parser.add_argument("--disable-reference-asr", action="store_true")
     args = parser.parse_args()
     logger.info(f"args: {args}")
 
