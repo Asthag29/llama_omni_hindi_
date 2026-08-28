@@ -1,3 +1,15 @@
+---
+language:
+- hi
+license: other
+base_model: ICTNLP/Llama-3.1-8B-Omni
+library_name: peft
+tags:
+- speech-to-speech
+- hindi
+- llama-omni
+---
+
 # 🦙🎧 Hindi LLaMA-Omni: Hindi Speech Interaction with Large Language Models
 
 > Hindi LLaMA-Omni is a Hindi speech-to-speech model built upon [LLaMA-Omni](https://github.com/ictnlp/LLaMA-Omni). It uses Whisper for speech understanding, a fine-tuned Hindi LLaMA-Omni backbone for response generation, and IndicF5 to synthesize answers in one fixed default Hindi voice.
