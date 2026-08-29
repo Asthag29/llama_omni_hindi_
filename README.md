@@ -52,28 +52,21 @@ The text instruction mixture includes AI4Bharat Indic-Instruct style sources suc
 
 The Hindi stage-2 adapter is published at
 [`Pastaaaaa2003/hindi-llama-omni-model`](https://huggingface.co/Pastaaaaa2003/hindi-llama-omni-model).
-The base LLaMA-Omni, Whisper, and IndicF5 checkpoints must be downloaded from
-their upstream repositories. Follow their respective terms, including the
-academic, non-commercial restriction for
+This is a thin release: this repository contains code only, and the model
+repository contains only the final stage-2 adapter. The other checkpoints are
+downloaded from their upstream owners. Follow their respective terms,
+including the academic, non-commercial restriction for
 [LLaMA-Omni](https://huggingface.co/ICTNLP/Llama-3.1-8B-Omni), and cite the
 original [LLaMA-Omni paper](https://arxiv.org/abs/2409.06666).
 
 ## 🛠️ Install
 
-The supported runtime is Linux with an NVIDIA GPU and CUDA 12.1. Keep at least
-25 GB free disk space. Apple Silicon is not currently a supported runtime for
-the Gradio server.
+The supported runtime is Linux with an NVIDIA GPU (about 24 GB VRAM) and
+CUDA 12.1. Keep about 40 GB free disk space for the environment and
+checkpoints. Apple Silicon is not currently a supported runtime for the
+Gradio server.
 
-#### 1. Install prerequisites
-
-Install Python 3.11.14, Git, `ffmpeg`, and an NVIDIA driver compatible with
-CUDA 12.1.
-
-```bash
-sudo apt-get update && sudo apt-get install -y ffmpeg git
-```
-
-#### 2. Clone this repository and create an environment
+#### 1. Clone this repository and create an environment
 
 Create and activate any Python 3.11.14 environment. The example below uses
 the standard-library `venv`:
@@ -86,7 +79,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 ```
 
-#### 3. Install dependencies
+#### 2. Install dependencies
 
 Install the CUDA-enabled PyTorch build appropriate for your system, then
 install the project packages:
@@ -95,30 +88,32 @@ install the project packages:
 pip install torch==2.1.2+cu121 torchvision==0.16.2+cu121 torchaudio==2.1.2+cu121 \
   --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
-pip install -e .
 pip install "f5_tts @ git+https://github.com/AI4Bharat/IndicF5.git@13f7c4d627cc10111aea8fe9c0039462cacacdc7"
 ```
 
 ## ⚡ Download model checkpoints
 
-Download the following checkpoints and place them exactly in the `models/`
-directory. The project expects these paths and will not search arbitrary
-locations on disk.
+[IndicF5](https://huggingface.co/ai4bharat/IndicF5) is a gated repository.
+Request access on that page first, then download it:
 
-1. Download [LLaMA-Omni](https://huggingface.co/ICTNLP/Llama-3.1-8B-Omni) and
-   place its files in `models/llama/`.
-2. Download the official Whisper `large-v3` checkpoint and place
-   `large-v3.pt` in `models/speech_encoder/`. You can use the included
-   `omni_speech/datasets/downloader/whisper_downloader.py` helper.
-3. Request access to [IndicF5](https://huggingface.co/ai4bharat/IndicF5), then
-   download its model snapshot into `models/indicf5/`. An authenticated
-   Hugging Face session is required for the first download and synthesis.
-4. Download this project's final stage-2 adapter from
-   [Pastaaaaa2003/hindi-llama-omni-model](https://huggingface.co/Pastaaaaa2003/hindi-llama-omni-model)
-   and place it in `models/hindi_ckpt/stage_2/speech_text/checkpoints/last/`.
+```bash
+hf download ai4bharat/IndicF5 \
+  --revision ba85abedf18dc479a447eaa0eccbd76ab78a47d5 \
+  --local-dir models/indicf5
+```
 
-Only the final stage-2 adapter is required for inference. Stage-1 checkpoints
-are training artifacts and are not distributed.
+Download the remaining public checkpoints with:
+
+```bash
+python omni_speech/datasets/downloader/download_models.py
+```
+
+The script fetches the pinned LLaMA-Omni weights, Whisper large-v3, and the
+Hindi stage-2 adapter into `models/`, and verifies the Whisper file. Run it
+again if a download is interrupted.
+
+Only the final stage-2 adapter is published by this project. Stage-1
+checkpoints are training artifacts and are not required for inference.
 
 The final layout must be:
 
@@ -217,7 +212,7 @@ Across the available evaluations, the fine-tuned model improves Hindi QA, answer
 ## 🙏 Acknowledgements
 
 - [LLaMA-Omni](https://github.com/ictnlp/LLaMA-Omni): base speech-language architecture and code structure.
-- [Whisper](https://github.com/openai/whisper): speech encoder used for spoken input and reference transcription.
+- [Whisper](https://github.com/openai/whisper): speech encoder for spoken input.
 - [IndicF5](https://github.com/AI4Bharat/IndicF5): Hindi/Indic speech-synthesis backend.
 - [AI4Bharat](https://ai4bharat.iitm.ac.in/): Indic instruction and speech resources.
 

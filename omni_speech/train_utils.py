@@ -313,8 +313,7 @@ class SafetensorsCheckpointCallback(Callback):
         tag = f"epoch={trainer.current_epoch}-step={trainer.global_step}-{self.monitor}={metric:.4f}"
         ckpt_dir = os.path.join(self.dirpath, tag)
 
-        # All ranks participate in save (ZeRO-3 needs gather on all ranks),
-        # but only rank 0 writes files — handled inside save_omni_speech_checkpoint.
+        # Rank 0 writes the files; save_omni_speech_checkpoint coordinates the rest.
         save_omni_speech_checkpoint(
             pl_module, ckpt_dir,
             metadata={"epoch": int(trainer.current_epoch), "global_step": int(trainer.global_step), self.monitor: metric},
