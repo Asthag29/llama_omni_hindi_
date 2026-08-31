@@ -1,11 +1,21 @@
 [
 {
-    "id": "hindi_sample",
-    "speech": "omni_speech/infer/examples/question_wav/hindi_sample.wav",
+    "id": "hindi_sample_1",
+    "speech": "omni_speech/infer/examples/example1.wav",
     "conversations": [
         {
             "from": "human",
-            "value": "<speech>\nYou must respond only in Hindi (Devanagari script). कृपया हिंदी में उत्तर दें।"
+            "value": "<speech>\n कृपया हिंदी में उत्तर दें।"
+        }
+    ]
+},
+ {
+    "id": "hindi_sample_2",
+    "speech": "omni_speech/infer/examples/example2.wav",
+    "conversations": [
+        {
+            "from": "human",
+            "value": "<speech>\n कृपया हिंदी में उत्तर दें।"
         }
     ]
 }

@@ -93,24 +93,36 @@ pip install "f5_tts @ git+https://github.com/AI4Bharat/IndicF5.git@13f7c4d627cc1
 
 ## ⚡ Download model checkpoints
 
-[IndicF5](https://huggingface.co/ai4bharat/IndicF5) is a gated repository.
-Request access on that page first, then download it:
+1. Download the `Llama-3.1-8B-Omni` model from 🤗 [Huggingface](https://huggingface.co/ICTNLP/Llama-3.1-8B-Omni) and place it in `models/llama/`.
 
-```bash
-hf download ai4bharat/IndicF5 \
-  --revision ba85abedf18dc479a447eaa0eccbd76ab78a47d5 \
-  --local-dir models/indicf5
+2. Download the `Whisper-large-v3` model.
+
+```python
+import whisper
+model = whisper.load_model("large-v3", download_root="models/speech_encoder/")
 ```
 
-Download the remaining public checkpoints with:
+3. [IndicF5](https://huggingface.co/ai4bharat/IndicF5) is a gated repository.
+   Request access on that page first, then download it:
 
 ```bash
-python omni_speech/datasets/downloader/download_models.py
+hf download ai4bharat/IndicF5 --local-dir models/indicf5
 ```
 
-The script fetches the pinned LLaMA-Omni weights, Whisper large-v3, and the
-Hindi stage-2 adapter into `models/`, and verifies the Whisper file. Run it
-again if a download is interrupted.
+4. Download this project's Hindi stage-2 adapter from 🤗 [Huggingface](https://huggingface.co/Pastaaaaa2003/hindi-llama-omni-model):
+
+```bash
+hf download Pastaaaaa2003/hindi-llama-omni-model --local-dir models/hindi
+```
+
+Then run this check from the repository root. It confirms that every required
+checkpoint file is present and that Whisper matches the official SHA-256:
+
+```bash
+python check_models.py
+```
+
+Do not start Gradio or `inference.py` until this check succeeds.
 
 Only the final stage-2 adapter is published by this project. Stage-1
 checkpoints are training artifacts and are not required for inference.
@@ -122,11 +134,7 @@ models/
 ├── llama/            # LLaMA-Omni base model
 ├── speech_encoder/   # Whisper large-v3 weights
 ├── indicf5/          # IndicF5 model snapshot
-└── hindi_ckpt/
-    └── stage_2/      # Hindi stage-2 inference checkpoint
-        └── speech_text/
-            └── checkpoints/
-                └── last/  # adapter and speech projector
+└── hindi/            # Hindi stage-2 adapter and speech projector
 ```
 
 ## 🎧 Run the Gradio demo
@@ -152,7 +160,7 @@ python -m omni_speech.serve.model_worker \
   --controller-address http://127.0.0.1:21001 \
   --model-path models/llama \
   --model-name llama-omni-hindi \
-  --checkpoint models/hindi_ckpt/stage_2/speech_text/checkpoints/last \
+  --checkpoint models/hindi \
   --config configs/stage_2.yaml \
   --device cuda
 ```
@@ -184,7 +192,7 @@ use the Gradio demo above for the complete speech-to-speech response.
 ```bash
 python -m omni_speech.infer.inference \
   --audio path/to/hindi-question.wav \
-  --checkpoint models/hindi_ckpt/stage_2/speech_text/checkpoints/last
+  --checkpoint models/hindi
 ```
 
 The tracked `data/inference.wav` file can be used as the default test audio.

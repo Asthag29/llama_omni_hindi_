@@ -253,16 +253,8 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
         if cur_dir is None:
             cur_dir = os.path.dirname(os.path.abspath(__file__))
         gr.Examples(examples=[
-            [f"{cur_dir}/examples/vicuna_1.wav"],
-            [f"{cur_dir}/examples/vicuna_2.wav"],
-            [f"{cur_dir}/examples/vicuna_3.wav"],
-            [f"{cur_dir}/examples/vicuna_4.wav"],
-            [f"{cur_dir}/examples/vicuna_5.wav"],
-            [f"{cur_dir}/examples/helpful_base_1.wav"],
-            [f"{cur_dir}/examples/helpful_base_2.wav"],
-            [f"{cur_dir}/examples/helpful_base_3.wav"],
-            [f"{cur_dir}/examples/helpful_base_4.wav"],
-            [f"{cur_dir}/examples/helpful_base_5.wav"],
+            [f"{cur_dir}/examples/example1.wav"],
+            [f"{cur_dir}/examples/example2.wav"],
         ], inputs=[audio_input_box])
 
         with gr.Row():

@@ -13,7 +13,7 @@ indic.py
 FINAL_REPORT.md
 logs/
 outputs/
-uv.lock
+
 
 delete_folder/
 
@@ -43,3 +43,18 @@ data/instruct
 
 
 data/datasets.json
+scripts/
+data/instruct/
+data/datasets.json
+delete_folder/
+images/image_1.png
+images/image_2.png
+images/image_3.png
+images/image_4.png
+images/image_5.png
+images/image_6.png
+images/image_7.png
+images/image_8.png
+
+scripts/
+hindi_ckpt/

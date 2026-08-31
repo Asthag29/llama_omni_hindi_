@@ -33,9 +33,7 @@ from omni_speech.train_utils import (
 AUDIO_PATH = REPO_ROOT / "data" / "inference.wav"
 CONFIG_PATH = REPO_ROOT / "configs" / "stage_2.yaml"
 
-# Leave CHECKPOINT_PATH as None to auto-pick the latest streaming-trainer checkpoint.
-# Default run written by stage-2 streaming training:
-# models/hindi_ckpt/stage_2/speech_text/checkpoints/last
+# Leave CHECKPOINT_PATH as None to auto-pick models/hindi, then any streaming run.
 CHECKPOINT_PATH = None
 STREAMING_RUN_ID = "speech_text"
 
@@ -83,12 +81,14 @@ def find_streaming_checkpoint(
 
     candidates = []
     run_roots = []
+    published = REPO_ROOT / "models" / "hindi"
+    if has_checkpoint_marker(published):
+        return published
+
     streaming_roots = [
-        REPO_ROOT / "models" / "hindi_ckpt" / "stage_2",
         REPO_ROOT / "outputs" / "stage_2",
     ]
     configured_roots = [
-        REPO_ROOT / "models" / "hindi_ckpt" / "stage_2" / "speech_text",
         REPO_ROOT / "outputs" / "stage_2" / "speech_text",
     ]
 
@@ -121,7 +121,7 @@ def find_streaming_checkpoint(
     if not candidates:
         raise FileNotFoundError(
             "No streaming safetensors checkpoint found. Set --checkpoint manually, "
-            "for example models/hindi_ckpt/stage_2/<run_id>/checkpoints/last."
+            "for example models/hindi."
         )
 
     return sorted(set(candidates), key=checkpoint_sort_key)[0]
