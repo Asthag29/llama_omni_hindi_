@@ -137,6 +137,21 @@ models/
 └── hindi/            # Hindi stage-2 adapter and speech projector
 ```
 
+#### IndicF5 load warning
+
+IndicF5 was saved with Transformers 4.49.0 and stores GRN affine weights and
+Vocos ConvNeXt layer-scale as `gamma` / `beta`. This repo pins
+`transformers==4.43.4` for LLaMA-Omni, which rewrites those substrings to
+`weight` / `bias` (old LayerNorm convention). Those tensors then miss the live
+modules, so the log reports unused `grn.weight` / `convnext.N.weight` and
+newly initialized `grn.gamma` / `convnext.N.gamma`. The snapshot itself is
+complete; this is a load-time rename, not a truncated checkpoint.
+
+**Resolution:** do not bump Transformers, or LLaMA-Omni will break. Load
+IndicF5 with `safetensors.torch.load_file("models/indicf5/model.safetensors")`
+and `load_state_dict(..., strict=False)` so keys are not rewritten. Speech-to-
+speech still runs if you ignore the warning; only those 16 tensors are wrong.
+
 ## 🎧 Run the Gradio demo
 
 Start each command in a separate terminal. Activate the environment and run
