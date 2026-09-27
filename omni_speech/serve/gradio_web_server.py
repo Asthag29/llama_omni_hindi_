@@ -1,5 +1,4 @@
 import argparse
-import datetime
 import json
 import os
 import time
@@ -13,7 +12,7 @@ import numpy as np
 import requests
 
 from omni_speech.conversation import default_conversation, conv_templates
-from omni_speech.constants import DEFAULT_SPEECH_PROMPT, LOGDIR
+from omni_speech.constants import DEFAULT_SPEECH_PROMPT
 from omni_speech.train_utils import build_logger, server_error_msg
 from omni_speech.model.speech_generator.speech_generator import IndicF5SpeechGenerator
 
@@ -28,16 +27,20 @@ DEFAULT_REFERENCE_TEXT = "तुम कौन हो"
 headers = {"User-Agent": "LLaMA-Omni Client"}
 
 
-def get_conv_log_filename():
-    t = datetime.datetime.now()
-    name = os.path.join(LOGDIR, f"{t.year}-{t.month:02d}-{t.day:02d}-conv.json")
-    return name
-
-
 def get_model_list():
-    ret = requests.post(args.controller_url + "/refresh_all_workers")
-    assert ret.status_code == 200
-    ret = requests.post(args.controller_url + "/list_models")
+    try:
+        ret = requests.post(args.controller_url + "/refresh_all_workers")
+        if ret.status_code != 200:
+            raise SystemExit(
+                f"Controller at {args.controller_url} returned status {ret.status_code} "
+                "for /refresh_all_workers."
+            )
+        ret = requests.post(args.controller_url + "/list_models")
+    except requests.exceptions.RequestException:
+        raise SystemExit(
+            f"Cannot reach the controller at {args.controller_url}. "
+            "Start `python -m omni_speech.serve.controller` first."
+        )
     models = ret.json()["models"]
     logger.info(f"Models: {models}")
     return models
@@ -80,7 +83,7 @@ def load_demo_refresh_model_list(request: gr.Request):
 def clear_history(request: gr.Request):
     logger.info(f"clear_history. ip: {request.client.host}")
     state = default_conversation.copy()
-    return (state, None, "", DEFAULT_REFERENCE_TEXT, None)
+    return (state, None, "", "", None)
 
 
 def normalize_audio(audio):
@@ -120,18 +123,17 @@ def add_speech(state, speech, request: gr.Request):
     state = default_conversation.copy()
     state.append_message(state.roles[0], text)
     state.append_message(state.roles[1], None)
-    state.skip_next = False
+    state.skip_next = speech is None
     return (state)
 
 
 def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request: gr.Request):
     logger.info(f"http_bot. ip: {request.client.host}")
-    start_tstamp = time.time()
     model_name = model_selector
 
     if state.skip_next:
         # This generate call is skipped due to invalid inputs
-        yield (state, "", "", None)
+        yield (state, "Please record or upload a Hindi question first.", "", None)
         return
 
     if len(state.messages) == state.offset + 2:
@@ -152,7 +154,7 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request:
     # No available worker
     if worker_addr == "":
         state.messages[-1][-1] = server_error_msg
-        yield (state, "", "", None)
+        yield (state, server_error_msg, "", None)
         return
 
     # Construct prompt
@@ -180,14 +182,13 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request:
         "audio": audio,
     }
 
-    yield (state, "", "", None)
-
-    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    thinking_status = "Listening and thinking…"
+    yield (state, thinking_status, "", None)
 
     try:
         # Stream output
         response = requests.post(worker_addr + "/worker_generate_stream",
-            headers=headers, json=pload, stream=True, timeout=10)
+            headers=headers, json=pload, stream=True, timeout=(10, 120))
         output = ""
         for chunk in response.iter_lines(decode_unicode=False, delimiter=b"\0"):
             if chunk:
@@ -196,28 +197,34 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request:
                     output = data["text"][len(prompt):].strip()
                     state.messages[-1][-1] = output
 
-                    yield (state, output, ref_text, None)
+                    yield (state, thinking_status, output, None)
                 else:
                     output = data["text"] + f" (error_code: {data['error_code']})"
                     state.messages[-1][-1] = output
-                    yield (state, "", "", None)
+                    yield (state, f"{server_error_msg} (error_code: {data['error_code']})", "", None)
                     return
                 time.sleep(0.03)
     except requests.exceptions.RequestException as e:
+        logger.error(f"Worker request failed: {e}")
         state.messages[-1][-1] = server_error_msg
-        yield (state, "", "", None)
+        yield (state, server_error_msg, "", None)
         return
 
-    return_value = synthesize_with_indicf5(output, ref_audio_path, ref_text)
-    yield (state, output, ref_text, return_value)
+    yield (state, "Generating speech…", output, None)
 
-    finish_tstamp = time.time()
+    return_value = synthesize_with_indicf5(output, ref_audio_path, ref_text)
+    if return_value is None:
+        yield (state, "Speech synthesis failed; see the server log.", output, None)
+    else:
+        yield (state, "", output, return_value)
+
     logger.info(f"{output}")
     logger.info(f"IndicF5 reference transcript: {ref_text}")
 
 
 title_markdown = ("""
-# 🎧 LLaMA-Omni: Seamless Speech Interaction with Large Language Models
+# 🦙🎧 Hindi LLaMA-Omni
+Record or upload a Hindi question and get a spoken Hindi answer.  ·  हिंदी में सवाल पूछें, जवाब आवाज़ में पाएँ।
 """)
 
 block_css = """
@@ -229,46 +236,52 @@ block_css = """
 """
 
 def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
-    with gr.Blocks(title="LLaMA-Omni Speech Chatbot", theme=gr.themes.Default(), css=block_css) as demo:
+    with gr.Blocks(title="Hindi LLaMA-Omni", theme=gr.themes.Soft(), css=block_css) as demo:
         state = gr.State()
 
         if not embed_mode:
             gr.Markdown(title_markdown)
 
-        with gr.Row(elem_id="model_selector_row"):
-            model_selector = gr.Dropdown(
-                choices=models,
-                value=models[0] if len(models) > 0 else "",
-                interactive=True,
-                show_label=False,
-                container=False)
-
-        with gr.Row():
-            audio_input_box = gr.Audio(sources=["upload", "microphone"], label="Speech Input")
-            with gr.Accordion("Parameters", open=True) as parameter_row:
-                temperature = gr.Slider(minimum=0.0, maximum=1.0, value=0.0, step=0.1, interactive=True, label="Temperature",)
-                top_p = gr.Slider(minimum=0.0, maximum=1.0, value=0.7, step=0.1, interactive=True, label="Top P",)
-                max_output_tokens = gr.Slider(minimum=0, maximum=1024, value=512, step=64, interactive=True, label="Max Output Tokens",)
-
         if cur_dir is None:
             cur_dir = os.path.dirname(os.path.abspath(__file__))
-        gr.Examples(examples=[
-            [f"{cur_dir}/examples/example1.wav"],
-            [f"{cur_dir}/examples/example2.wav"],
-        ], inputs=[audio_input_box])
 
         with gr.Row():
-            submit_btn = gr.Button(value="Send", variant="primary")
-            clear_btn = gr.Button(value="Clear")
+            with gr.Column(scale=1):
+                audio_input_box = gr.Audio(
+                    sources=["upload", "microphone"],
+                    label="Your question (Hindi)",
+                )
+                gr.Examples(
+                    examples=[
+                        [f"{cur_dir}/examples/example1.wav"],
+                        [f"{cur_dir}/examples/example2.wav"],
+                    ],
+                    inputs=[audio_input_box],
+                    label="Try an example",
+                )
+                with gr.Row(elem_id="buttons"):
+                    submit_btn = gr.Button(value="Ask", variant="primary")
+                    clear_btn = gr.Button(value="Clear")
+                with gr.Accordion("Advanced", open=False):
+                    model_selector = gr.Dropdown(
+                        choices=models,
+                        value=models[0] if models else "",
+                        label="Model",
+                        interactive=True,
+                    )
+                    temperature = gr.Slider(minimum=0.0, maximum=1.0, value=0.0, step=0.1, interactive=True, label="Temperature")
+                    top_p = gr.Slider(minimum=0.0, maximum=1.0, value=0.7, step=0.1, interactive=True, label="Top P")
+                    max_output_tokens = gr.Slider(minimum=64, maximum=1024, value=512, step=64, interactive=True, label="Max Output Tokens")
+                    gr.Textbox(
+                        label="IndicF5 reference transcript (fixed voice)",
+                        value=DEFAULT_REFERENCE_TEXT,
+                        interactive=False,
+                    )
 
-        text_output_box = gr.Textbox(label="Text Output", type="text")
-        reference_text_box = gr.Textbox(
-            label="Default Reference Transcript",
-            value=DEFAULT_REFERENCE_TEXT,
-            interactive=False,
-            type="text",
-        )
-        audio_output_box = gr.Audio(label="Speech Output")
+            with gr.Column(scale=1):
+                status_box = gr.Markdown("")
+                text_output_box = gr.Textbox(label="Answer (text)", lines=6, interactive=False)
+                audio_output_box = gr.Audio(label="Answer (speech)", autoplay=True, interactive=False)
 
         url_params = gr.JSON(visible=False)
 
@@ -279,14 +292,14 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
         ).then(
             http_bot,
             [state, model_selector, temperature, top_p, max_output_tokens],
-            [state, text_output_box, reference_text_box, audio_output_box],
+            [state, status_box, text_output_box, audio_output_box],
             concurrency_limit=concurrency_count
         )
 
         clear_btn.click(
             clear_history,
             None,
-            [state, audio_input_box, text_output_box, reference_text_box, audio_output_box],
+            [state, audio_input_box, status_box, text_output_box, audio_output_box],
             queue=False
         )
 
@@ -329,7 +342,6 @@ if __name__ == "__main__":
     parser.add_argument("--model-list-mode", type=str, default="once",
         choices=["once", "reload"])
     parser.add_argument("--share", action="store_true")
-    parser.add_argument("--moderate", action="store_true")
     parser.add_argument("--embed", action="store_true")
     parser.add_argument("--indicf5-model-path", type=str, default="models/indicf5")
     parser.add_argument("--indicf5-repo-id", type=str, default="ai4bharat/IndicF5")
