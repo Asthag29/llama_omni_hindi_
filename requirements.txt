@@ -34,3 +34,6 @@ wandb>=0.16.0
 # Evaluation
 bert-score==0.3.13
 lm-eval @ git+https://github.com/anushaknvidia/lm-evaluation-harness.git@0cb92edba39621e2230bd4f1c5608e3b37aa8b8d
+
+# Testing
+pytest

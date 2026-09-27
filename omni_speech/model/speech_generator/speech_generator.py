@@ -4,7 +4,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from huggingface_hub.errors import HFValidationError
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file
+from transformers import AutoConfig
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 
 class IndicF5SpeechGenerator:
@@ -26,29 +29,21 @@ class IndicF5SpeechGenerator:
     @property
     def model(self):
         if self._model is None:
-            try:
-                from transformers import AutoConfig, AutoModel
-            except ImportError as exc:
-                raise RuntimeError("IndicF5 requires transformers to be installed.") from exc
-
-            if self.model_path.exists():
-                model_source = str(self.model_path.resolve())
-                config = AutoConfig.from_pretrained(model_source, trust_remote_code=True)
-                # IndicF5's remote code uses config.name_or_path with hf_hub_download
-                # for vocab lookup, so keep that value as the Hub repo id even when
-                # loading the weights from a local snapshot.
-                config.name_or_path = self.repo_id
-                try:
-                    self._model = AutoModel.from_pretrained(model_source, config=config, trust_remote_code=True)
-                except HFValidationError:
-                    # The upstream IndicF5 modeling code currently calls
-                    # hf_hub_download(config.name_or_path, ...). Transformers
-                    # rewrites name_or_path to the local folder during local
-                    # loading, so fall back to the Hub repo while using the
-                    # already-populated cache/downloaded snapshot.
-                    self._model = AutoModel.from_pretrained(self.repo_id, trust_remote_code=True)
-            else:
-                self._model = AutoModel.from_pretrained(self.repo_id, trust_remote_code=True)
+            if not self.model_path.exists():
+                # First run: fetch the snapshot into model_path so the local path always exists
+                snapshot_download(self.repo_id, local_dir=str(self.model_path))
+            model_source = str(self.model_path.resolve())
+            config = AutoConfig.from_pretrained(model_source, trust_remote_code=True)
+            # IndicF5's remote code calls hf_hub_download(config.name_or_path, "checkpoints/vocab.txt"),
+            # so this must stay the Hub repo id, not the local folder.
+            config.name_or_path = self.repo_id
+            model_cls = get_class_from_dynamic_module(config.auto_map["AutoModel"], model_source)
+            self._model = model_cls(config)
+            state = load_file(str(self.model_path / "model.safetensors"), device="cpu")
+            # Deliberately not from_pretrained: Transformers 4.43.4 renames gamma/beta keys
+            # to weight/bias while loading and silently drops IndicF5's 16 GRN / layer-scale
+            # tensors. strict=True guarantees every checkpoint tensor lands.
+            self._model.load_state_dict(state, strict=True)
             if hasattr(self._model, "to"):
                 self._model = self._model.to(self.device)
             if hasattr(self._model, "eval"):
