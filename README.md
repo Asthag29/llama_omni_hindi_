@@ -39,7 +39,7 @@ configs/              # stage_1.yaml, stage_2.yaml, combined.yaml
 evaluations/          # benchmark scripts and results/summary.md
 tests/                # pytest suite
 check_models.py       # verifies every checkpoint file is present
-data/inference.wav    # sample Hindi question; also the IndicF5 reference voice
+data/inference.wav    # IndicF5 reference voice; also the default test question
 ```
 
 ## 🛠️ Install
@@ -175,7 +175,8 @@ python -m omni_speech.serve.gradio_web_server \
 
 Open <http://127.0.0.1:7860/> and record or upload a Hindi speech question.
 The demo returns a Hindi audio answer using `data/inference.wav` as the fixed
-IndicF5 reference voice with the fixed reference transcript `तुम कौन हो`;
+IndicF5 reference voice with its fixed transcript (the first lines of the poem
+*तितली रानी*, set in `DEFAULT_REFERENCE_TEXT` in `gradio_web_server.py`);
 Whisper is not used to transcribe reference audio. Add `--share` for a public
 Gradio link, or `--indicf5-device cpu` to keep IndicF5 off the GPU.
 

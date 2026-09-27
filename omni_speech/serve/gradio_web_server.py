@@ -22,7 +22,11 @@ logger = build_logger("gradio_web_server", "gradio_web_server.log")
 speech_generator = None
 
 DEFAULT_REFERENCE_AUDIO = Path(__file__).resolve().parents[2] / "data" / "inference.wav"
-DEFAULT_REFERENCE_TEXT = "तुम कौन हो"
+DEFAULT_REFERENCE_TEXT = (
+    "तितली रानी तितली रानी, तितली रानी, इतने सुंदर पंख कहां से लाई हो। "
+    "क्या तुम कोई हो शहजादी, या परी लोक से आई हो। "
+    "फूल तुम्हें भी अच्छे लगते, फूल हमें भी भाते है।"
+)
 
 headers = {"User-Agent": "LLaMA-Omni Client"}
 
