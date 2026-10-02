@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import safe_open
 
-from omni_speech.model.speech_generator.speech_generator import IndicF5SpeechGenerator
+from omni_speech.tts.indicf5 import IndicF5SpeechGenerator
 
 CHECKPOINT = Path("models/indicf5/model.safetensors")
 

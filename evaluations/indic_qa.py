@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate base and stage-1 checkpoints on the Hindi IndicQA test set.
+"""Evaluate the base model and the fine-tuned adapter (default: models/hindi) on the Hindi IndicQA test set.
 
 Task example:
     Context: नाना साहब पेशवा बाजीराव द्वितीय के दत्तक पुत्र थे...
@@ -508,10 +508,16 @@ def resolve_device(device: str) -> str:
     return device
 
 
+def _model_choice(value: str) -> str:
+    """Map the deprecated ``stage1`` label to ``finetuned``."""
+    return "finetuned" if value == "stage1" else value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["base", "stage1", "both"], default="both")
-    parser.add_argument("--checkpoint", default=str(REPO_ROOT / "outputs" / "stage_1" / "backbone_text" / "final_model"))
+    parser.add_argument("--model", type=_model_choice, choices=["base", "finetuned", "both"], default="both",
+                        help="Which model to evaluate. 'stage1' is accepted as a deprecated alias for 'finetuned'.")
+    parser.add_argument("--checkpoint", default=str(REPO_ROOT / "models" / "hindi"))
     parser.add_argument("--limit", type=int, default=None, help="Optional number of examples to evaluate. Defaults to all.")
     parser.add_argument("--max-input-tokens", type=int, default=2048, help="Skip rows where context+question prompt exceeds this token length.")
     parser.add_argument("--max-new-tokens", type=int, default=32, help="Maximum generated answer tokens for EM/F1 scoring.")
@@ -569,10 +575,10 @@ def main() -> None:
                 args.bertscore_batch_size,
             )
 
-    if args.model in {"stage1", "both"}:
+    if args.model in {"finetuned", "both"}:
         tokenizer, model, model_ref = load_lora_model(device, args.checkpoint)
-        results["models"]["stage1"] = evaluate_model(
-            "stage1",
+        results["models"]["finetuned"] = evaluate_model(
+            "finetuned",
             model_ref,
             tokenizer,
             model,
@@ -585,21 +591,21 @@ def main() -> None:
         release_model(model)
         if not args.skip_bertscore:
             add_bertscore_to_result(
-                results["models"]["stage1"],
+                results["models"]["finetuned"],
                 args.bertscore_model,
                 args.bertscore_device,
                 args.bertscore_batch_size,
             )
 
-    if "base" in results["models"] and "stage1" in results["models"]:
+    if "base" in results["models"] and "finetuned" in results["models"]:
         base = results["models"]["base"]
-        stage1 = results["models"]["stage1"]
+        finetuned = results["models"]["finetuned"]
         results["comparison"] = {
-            "stage1_minus_base_mean_nll": stage1["mean_nll"] - base["mean_nll"],
-            "stage1_minus_base_perplexity": stage1["perplexity"] - base["perplexity"],
-            "stage1_minus_base_contains_match": stage1["contains_match"] - base["contains_match"],
-            "stage1_minus_base_f1": stage1["f1"] - base["f1"],
-            "stage1_minus_base_bertscore_f1": stage1.get("bertscore_f1", 0.0) - base.get("bertscore_f1", 0.0),
+            "finetuned_minus_base_mean_nll": finetuned["mean_nll"] - base["mean_nll"],
+            "finetuned_minus_base_perplexity": finetuned["perplexity"] - base["perplexity"],
+            "finetuned_minus_base_contains_match": finetuned["contains_match"] - base["contains_match"],
+            "finetuned_minus_base_f1": finetuned["f1"] - base["f1"],
+            "finetuned_minus_base_bertscore_f1": finetuned.get("bertscore_f1", 0.0) - base.get("bertscore_f1", 0.0),
         }
 
     out_path = Path(args.output)

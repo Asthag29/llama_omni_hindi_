@@ -17,9 +17,7 @@ import json
 import csv
 import os
 import shutil
-import sys
 import logging
-import logging.handlers
 from typing import Dict, Optional
 
 import numpy as np
@@ -32,12 +30,6 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from omegaconf import DictConfig, OmegaConf
 from safetensors.torch import load_file, save_file
-
-from omni_speech.constants import LOGDIR
-
-server_error_msg = "**NETWORK ERROR DUE TO HIGH TRAFFIC. PLEASE REGENERATE OR REFRESH THIS PAGE.**"
-
-handler = None
 
 
 def load_audio_16k(path: str, sample_rate: int = 16000) -> np.ndarray:
@@ -65,88 +57,6 @@ def model_dtype(precision):
     if "16" in precision:
         return torch.float16
     return torch.float32
-
-
-def build_logger(logger_name, logger_filename):
-    global handler
-
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    # Set the format of root handlers
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO)
-    logging.getLogger().handlers[0].setFormatter(formatter)
-
-    # Redirect stdout and stderr to loggers
-    stdout_logger = logging.getLogger("stdout")
-    stdout_logger.setLevel(logging.INFO)
-    sl = StreamToLogger(stdout_logger, logging.INFO)
-    sys.stdout = sl
-
-    stderr_logger = logging.getLogger("stderr")
-    stderr_logger.setLevel(logging.ERROR)
-    sl = StreamToLogger(stderr_logger, logging.ERROR)
-    sys.stderr = sl
-
-    # Get logger
-    logger = logging.getLogger(logger_name)
-    logger.setLevel(logging.INFO)
-
-    # Add a file handler for all loggers
-    if handler is None:
-        os.makedirs(LOGDIR, exist_ok=True)
-        filename = os.path.join(LOGDIR, logger_filename)
-        handler = logging.handlers.TimedRotatingFileHandler(
-            filename, when='D', utc=True, encoding='UTF-8')
-        handler.setFormatter(formatter)
-
-        for name, item in logging.root.manager.loggerDict.items():
-            if isinstance(item, logging.Logger):
-                item.addHandler(handler)
-
-    return logger
-
-
-class StreamToLogger(object):
-    """
-    Fake file-like stream object that redirects writes to a logger instance.
-    """
-    def __init__(self, logger, log_level=logging.INFO):
-        self.terminal = sys.stdout
-        self.logger = logger
-        self.log_level = log_level
-        self.linebuf = ''
-
-    def __getattr__(self, attr):
-        return getattr(self.terminal, attr)
-
-    def write(self, buf):
-        temp_linebuf = self.linebuf + buf
-        self.linebuf = ''
-        for line in temp_linebuf.splitlines(True):
-            # From the io.TextIOWrapper docs:
-            #   On output, if newline is None, any '\n' characters written
-            #   are translated to the system default line separator.
-            # By default sys.stdout.write() expects '\n' newlines and then
-            # translates them so this is still cross platform.
-            if line[-1] == '\n':
-                self.logger.log(self.log_level, line.rstrip())
-            else:
-                self.linebuf += line
-
-    def flush(self):
-        if self.linebuf != '':
-            self.logger.log(self.log_level, self.linebuf.rstrip())
-        self.linebuf = ''
-
-
-def pretty_print_semaphore(semaphore):
-    if semaphore is None:
-        return "None"
-    return f"Semaphore(value={semaphore._value}, locked={semaphore.locked()})"
 
 
 # --- Safetensors checkpoints (trainable LoRA + speech projector only) ---
@@ -452,7 +362,7 @@ def build_callbacks(cfg: DictConfig, has_validation: bool):
     return callbacks
 
 
-# --- Training log (loguru) ---
+# --- Training log (stdlib logging) ---
 
 def format_metrics_table(headers, rows):
     widths = [len(str(h)) for h in headers]
@@ -591,15 +501,6 @@ class LocalMetricsLogCallback(Callback):
         self.epoch_records = {}
         self._write_epoch_log()
         self._write_epoch_csv()
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
-        if trainer.global_rank != 0:
-            return
-        train_loss = self._metric(trainer, "train_loss")
-        if train_loss is None:
-            return
-        # Per-step metrics still go to Lightning/W&B/CSV summaries; we no longer
-        # mirror them into a separate local train_perstep.log file.
 
     def on_validation_epoch_end(self, trainer, pl_module) -> None:
         self._record_epoch(trainer)

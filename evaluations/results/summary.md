@@ -8,7 +8,7 @@ This report compares the original/base backbone against the fine-tuned model.
 Run the scripts directly from an activated environment:
 
 ```bash
-python evaluations/indicQA.py
+python evaluations/indic_qa.py
 python evaluations/mt_bench_hi.py
 python evaluations/if_eval_hi.py
 python evaluations/gsm8k_hi.py

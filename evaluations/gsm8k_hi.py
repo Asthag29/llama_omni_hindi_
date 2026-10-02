@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate base and stage-1 checkpoints on NVIDIA GSM8K-Hi.
+"""Evaluate the base model and the fine-tuned adapter (default: models/hindi) on NVIDIA GSM8K-Hi.
 
 Task example:
     Question: जेनेट की बत्तखें प्रतिदिन 16 अंडे देती हैं...
@@ -12,7 +12,6 @@ import argparse
 import csv
 import gc
 import json
-import math
 import re
 import sys
 import urllib.parse
@@ -35,7 +34,7 @@ from omni_speech.model.language_model.omni_speech_llama import (  # noqa: E402
 
 DATASET = "nvidia/GSM8K-Hi"
 DEFAULT_OUTPUT = REPO_ROOT / "evaluations" / "results" / "gsm8k_hi.json"
-STAGE1_ADAPTER = REPO_ROOT / "outputs" / "stage_1" / "backbone_text" / "final_model"
+FINETUNED_ADAPTER = REPO_ROOT / "models" / "hindi"
 
 
 def dtype_for_device(device: str) -> torch.dtype:
@@ -286,10 +285,16 @@ def write_results_csv(results: dict, output_path: Path) -> Path:
     return csv_path
 
 
+def _model_choice(value: str) -> str:
+    """Map the deprecated ``stage1`` label to ``finetuned``."""
+    return "finetuned" if value == "stage1" else value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["base", "stage1", "both"], default="both")
-    parser.add_argument("--checkpoint", default=str(STAGE1_ADAPTER))
+    parser.add_argument("--model", type=_model_choice, choices=["base", "finetuned", "both"], default="both",
+                        help="Which model to evaluate. 'stage1' is accepted as a deprecated alias for 'finetuned'.")
+    parser.add_argument("--checkpoint", default=str(FINETUNED_ADAPTER))
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--max-input-tokens", type=int, default=2048)
     parser.add_argument("--max-new-tokens", type=int, default=256)
@@ -331,10 +336,10 @@ def main() -> None:
         )
         release_model(model)
 
-    if args.model in {"stage1", "both"}:
+    if args.model in {"finetuned", "both"}:
         tokenizer, model, model_ref = load_lora_model(device, args.checkpoint)
-        results["models"]["stage1"] = evaluate_model(
-            "stage1",
+        results["models"]["finetuned"] = evaluate_model(
+            "finetuned",
             model_ref,
             tokenizer,
             model,
@@ -346,10 +351,10 @@ def main() -> None:
         )
         release_model(model)
 
-    if "base" in results["models"] and "stage1" in results["models"]:
+    if "base" in results["models"] and "finetuned" in results["models"]:
         base = results["models"]["base"]
-        stage1 = results["models"]["stage1"]
-        results["comparison"] = {"stage1_minus_base_accuracy": stage1["accuracy"] - base["accuracy"]}
+        finetuned = results["models"]["finetuned"]
+        results["comparison"] = {"finetuned_minus_base_accuracy": finetuned["accuracy"] - base["accuracy"]}
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

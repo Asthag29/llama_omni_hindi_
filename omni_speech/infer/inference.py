@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run OmniSpeech inference on data/inference.wav using a streaming checkpoint."""
+"""Run OmniSpeech inference on data/inference.wav using a stage-2 checkpoint."""
 
 from __future__ import annotations
 
@@ -8,10 +8,7 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
 import torch
-import torchaudio
 import whisper
 from omegaconf import OmegaConf
 
@@ -25,6 +22,7 @@ from omni_speech.datasets.preprocess import tokenizer_speech_token
 from omni_speech.training.combined import OmniSpeechTrainingModule
 from omni_speech.train_utils import (
     is_safetensors_checkpoint,
+    load_audio_16k,
     load_omni_speech_checkpoint,
     model_dtype,
     resolve_checkpoint_path,
@@ -33,9 +31,9 @@ from omni_speech.train_utils import (
 AUDIO_PATH = REPO_ROOT / "data" / "inference.wav"
 CONFIG_PATH = REPO_ROOT / "configs" / "stage_2.yaml"
 
-# Leave CHECKPOINT_PATH as None to auto-pick models/hindi, then any streaming run.
+# Leave CHECKPOINT_PATH as None to auto-pick models/hindi, then a stage-2 run under outputs/stage_2.
 CHECKPOINT_PATH = None
-STREAMING_RUN_ID = "speech_text"
+STAGE2_RUN_ID = "speech_text"
 
 CONV_MODE = "llama_3"
 DEFAULT_PROMPT = DEFAULT_SPEECH_PROMPT
@@ -44,17 +42,6 @@ MAX_NEW_TOKENS = 256
 TEMPERATURE = 0.0
 TOP_P = None
 NUM_BEAMS = 1
-
-CHECKPOINT_MARKERS = (
-    "adapter_model.safetensors",
-    "speech_projector.safetensors",
-    "trainable.safetensors",
-)
-
-
-def has_checkpoint_marker(path: Path) -> bool:
-    return path.is_dir() and any((path / marker).is_file() for marker in CHECKPOINT_MARKERS)
-
 
 def checkpoint_sort_key(path: Path):
     if path.name == "final_model":
@@ -72,36 +59,30 @@ def checkpoint_sort_key(path: Path):
     return (2, 0.0, -path.stat().st_mtime)
 
 
-def find_streaming_checkpoint(
+def find_stage2_checkpoint(
     checkpoint_path: str | Path | None = CHECKPOINT_PATH,
-    streaming_run_id: str | None = STREAMING_RUN_ID,
+    run_id: str | None = STAGE2_RUN_ID,
 ) -> Path:
+    """Pick the checkpoint to load: explicit path, then models/hindi, then a stage-2 run."""
     if checkpoint_path is not None:
         return Path(checkpoint_path).expanduser().resolve()
 
-    candidates = []
-    run_roots = []
     published = REPO_ROOT / "models" / "hindi"
-    if has_checkpoint_marker(published):
+    if is_safetensors_checkpoint(published):
         return published
 
-    streaming_roots = [
-        REPO_ROOT / "outputs" / "stage_2",
-    ]
-    configured_roots = [
-        REPO_ROOT / "outputs" / "stage_2" / "speech_text",
-    ]
-
-    if streaming_run_id:
-        run_roots.extend(root / streaming_run_id for root in streaming_roots)
+    stage2_root = REPO_ROOT / "outputs" / "stage_2"
+    if run_id:
+        run_roots = [stage2_root / run_id]
+    elif stage2_root.is_dir():
+        run_roots = sorted(path for path in stage2_root.iterdir() if path.is_dir())
     else:
-        for root in streaming_roots:
-            if root.is_dir():
-                run_roots.extend(sorted(path for path in root.iterdir() if path.is_dir()))
-    run_roots.extend(configured_roots)
+        run_roots = []
+    # Always fall back to the default stage-2 run directory.
+    run_roots.append(stage2_root / STAGE2_RUN_ID)
 
     seen = set()
-    fallback_candidates = []
+    candidates = []
     for root in run_roots:
         if root in seen or not root.exists():
             continue
@@ -109,18 +90,16 @@ def find_streaming_checkpoint(
 
         preferred = [root / "checkpoints" / "last", root / "final_model"]
         for path in preferred:
-            if has_checkpoint_marker(path):
+            if is_safetensors_checkpoint(path):
                 return path
 
         ckpt_root = root / "checkpoints"
         if ckpt_root.is_dir():
-            fallback_candidates.extend(path for path in ckpt_root.iterdir() if has_checkpoint_marker(path))
-
-    candidates.extend(fallback_candidates)
+            candidates.extend(path for path in ckpt_root.iterdir() if is_safetensors_checkpoint(path))
 
     if not candidates:
         raise FileNotFoundError(
-            "No streaming safetensors checkpoint found. Set --checkpoint manually, "
+            "No stage-2 safetensors checkpoint found. Set --checkpoint manually, "
             "for example models/hindi."
         )
 
@@ -136,7 +115,7 @@ def load_inference_cfg(config_path: Path):
     cfg.model.model_base = str((REPO_ROOT / cfg.model.model_base).resolve())
     cfg.model.tokenizer_path = str((REPO_ROOT / cfg.model.tokenizer_path).resolve())
 
-    # The selected streaming checkpoint already contains the final LoRA adapter
+    # The selected stage-2 checkpoint already contains the final LoRA adapter
     # and speech projector, so do not load the backbone init checkpoint first.
     cfg.model.init_checkpoint = None
     cfg.training.gradient_checkpointing = False
@@ -174,17 +153,6 @@ def load_module_from_checkpoint(
     module.eval().to(device)
     module.model.config.use_cache = True
     return module, device
-
-
-def load_audio_16k(audio_path: Path, sample_rate: int = 16000) -> np.ndarray:
-    audio, file_sr = sf.read(audio_path, dtype="float32", always_2d=False)
-    if audio.ndim > 1:
-        audio = audio.mean(axis=-1)
-    if file_sr != sample_rate:
-        waveform = torch.from_numpy(audio).unsqueeze(0)
-        waveform = torchaudio.functional.resample(waveform, int(file_sr), sample_rate)
-        audio = waveform.squeeze(0).numpy()
-    return audio.astype(np.float32)
 
 
 def prepare_speech(audio_path: Path, cfg, module, device: torch.device):
@@ -268,7 +236,8 @@ def parse_args():
     parser.add_argument("--audio", type=Path, default=AUDIO_PATH)
     parser.add_argument("--config", type=Path, default=CONFIG_PATH)
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
-    parser.add_argument("--streaming-run-id", default=STREAMING_RUN_ID)
+    parser.add_argument("--run-id", "--streaming-run-id", dest="run_id", default=STAGE2_RUN_ID,
+                        help="Run directory under outputs/stage_2 to search when --checkpoint is not set.")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
     parser.add_argument("--temperature", type=float, default=TEMPERATURE)
@@ -289,7 +258,7 @@ def main():
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    checkpoint = find_streaming_checkpoint(args.checkpoint, args.streaming_run_id)
+    checkpoint = find_stage2_checkpoint(args.checkpoint, args.run_id)
     print(f"Repo root: {REPO_ROOT}")
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():

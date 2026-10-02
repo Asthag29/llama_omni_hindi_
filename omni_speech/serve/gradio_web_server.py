@@ -14,8 +14,8 @@ import requests
 
 from omni_speech.conversation import default_conversation, conv_templates
 from omni_speech.constants import DEFAULT_SPEECH_PROMPT
-from omni_speech.train_utils import build_logger, server_error_msg
-from omni_speech.model.speech_generator.speech_generator import IndicF5SpeechGenerator
+from omni_speech.serve.utils import build_logger, server_error_msg
+from omni_speech.tts.indicf5 import IndicF5SpeechGenerator
 
 
 logger = build_logger("gradio_web_server", "gradio_web_server.log")
@@ -29,7 +29,7 @@ DEFAULT_REFERENCE_TEXT = (
     "फूल तुम्हें भी अच्छे लगते, फूल हमें भी भाते है।"
 )
 
-headers = {"User-Agent": "LLaMA-Omni Client"}
+headers = {"User-Agent": "Hindi LLaMA-Omni Client"}
 
 
 def get_model_list():

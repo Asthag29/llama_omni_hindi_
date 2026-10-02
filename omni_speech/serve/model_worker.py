@@ -19,16 +19,13 @@ import numpy as np
 from functools import partial
 
 from omni_speech.constants import WORKER_HEART_BEAT_INTERVAL
-from omni_speech.train_utils import (build_logger, server_error_msg,
+from omni_speech.serve.utils import (build_logger, server_error_msg,
     pretty_print_semaphore)
-from omni_speech.model.builder import load_pretrained_model
 from omni_speech.datasets.preprocess import tokenizer_speech_token
 from omni_speech.infer.inference import load_inference_cfg, load_module_from_checkpoint
 from transformers import TextIteratorStreamer
 from threading import Thread
 
-
-GB = 1 << 30
 
 worker_id = str(uuid.uuid4())[:6]
 logger = build_logger("model_worker", f"model_worker_{worker_id}.log")
@@ -57,35 +54,25 @@ def load_speech(audio, input_type, mel_size, speech_normalize):
 
 
 class ModelWorker:
-    def __init__(self, controller_addr, worker_addr,
-                 worker_id, no_register,
-                 model_path, model_base, model_name,
-                 load_8bit, load_4bit, device, input_type, mel_size, is_lora,
-                 checkpoint_path=None, config_path=None, use_flash_attn=False):
+    def __init__(self, controller_addr, worker_addr, no_register,
+                 model_name, device, input_type, mel_size,
+                 checkpoint_path, config_path=None):
         self.controller_addr = controller_addr
         self.worker_addr = worker_addr
-        self.worker_id = worker_id
         self.device = device
         self.model_name = model_name
         self.input_type = input_type
         self.mel_size = mel_size
-        if checkpoint_path:
-            config_path = config_path or "configs/stage_2.yaml"
-            cfg = load_inference_cfg(Path(config_path).expanduser().resolve())
-            module, loaded_device = load_module_from_checkpoint(
-                Path(checkpoint_path).expanduser().resolve(),
-                cfg,
-                requested_device=self.device,
-            )
-            self.device = str(loaded_device)
-            self.tokenizer = module.tokenizer
-            self.model = module.model
-            self.context_len = getattr(self.model.config, "max_sequence_length", 2048)
-        else:
-            self.tokenizer, self.model, self.context_len = load_pretrained_model(
-                model_path, model_base, is_lora=is_lora, load_8bit=load_8bit,
-                load_4bit=load_4bit, device=self.device,
-                use_flash_attn=use_flash_attn)
+        config_path = config_path or "configs/stage_2.yaml"
+        cfg = load_inference_cfg(Path(config_path).expanduser().resolve())
+        module, loaded_device = load_module_from_checkpoint(
+            Path(checkpoint_path).expanduser().resolve(),
+            cfg,
+            requested_device=self.device,
+        )
+        self.device = str(loaded_device)
+        self.tokenizer = module.tokenizer
+        self.model = module.model
 
         if not no_register:
             self.register_to_controller()
@@ -154,7 +141,6 @@ class ModelWorker:
             speech_tensor = speech.unsqueeze(0).to(self.device, dtype=speech_dtype)
             speech_args = {"speech": speech_tensor, "speech_lengths": speech_length}
         else:
-            speech = None
             speech_args = {}
 
         temperature = float(params.get("temperature", 1.0))
@@ -165,8 +151,6 @@ class ModelWorker:
 
         input_ids = tokenizer_speech_token(prompt, tokenizer, return_tensors='pt').unsqueeze(0).to(self.device)
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=15)
-
-        # max_new_tokens = min(max_new_tokens, max_context_length - input_ids.shape[-1] - num_image_tokens)
 
         if max_new_tokens < 1:
             yield json.dumps({"text": ori_prompt + "Exceeds max token length. Please start a new conversation, thanks.", "error_code": 0}).encode() + b"\0"
@@ -256,38 +240,26 @@ if __name__ == "__main__":
         default="http://localhost:21002")
     parser.add_argument("--controller-address", type=str,
         default="http://localhost:21001")
-    parser.add_argument("--model-path", type=str, default="facebook/opt-350m")
-    parser.add_argument("--model-base", type=str, default=None)
+    parser.add_argument("--model-path", type=str, default=None,
+        help="Deprecated and ignored; the base model path comes from the checkpoint's config.")
     parser.add_argument("--model-name", type=str)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--checkpoint", type=str, default="models/hindi")
     parser.add_argument("--config", type=str, default="configs/stage_2.yaml")
     parser.add_argument("--limit-model-concurrency", type=int, default=5)
-    parser.add_argument("--stream-interval", type=int, default=1)
     parser.add_argument("--no-register", action="store_true")
-    parser.add_argument("--load-8bit", action="store_true")
-    parser.add_argument("--load-4bit", action="store_true")
-    parser.add_argument("--use-flash-attn", action="store_true")
     parser.add_argument("--input-type", type=str, default="mel")
     parser.add_argument("--mel-size", type=int, default=128)
-    parser.add_argument("--is-lora", action="store_true", default=False)
     args = parser.parse_args()
     logger.info(f"args: {args}")
 
     worker = ModelWorker(args.controller_address,
                          args.worker_address,
-                         worker_id,
                          args.no_register,
-                         args.model_path,
-                         args.model_base,
                          args.model_name,
-                         args.load_8bit,
-                         args.load_4bit,
                          args.device,
                          args.input_type,
                          args.mel_size,
-                         args.is_lora,
                          checkpoint_path=args.checkpoint,
-                         config_path=args.config,
-                         use_flash_attn=args.use_flash_attn)
+                         config_path=args.config)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

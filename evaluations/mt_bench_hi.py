@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate first-turn responses for NVIDIA MT-Bench-Hi.
+"""Generate first-turn responses for NVIDIA MT-Bench-Hi from the base model and the fine-tuned adapter (default: models/hindi).
 
 Task example:
     First turn: भारत के मानसून पर एक विस्तृत उत्तर दें...
@@ -33,7 +33,7 @@ from omni_speech.model.language_model.omni_speech_llama import (  # noqa: E402
 
 DATASET = "nvidia/MT-Bench-Hi"
 DEFAULT_OUTPUT = REPO_ROOT / "evaluations" / "results" / "mt_bench_hi.json"
-STAGE1_ADAPTER = REPO_ROOT / "outputs" / "stage_1" / "backbone_text" / "final_model"
+FINETUNED_ADAPTER = REPO_ROOT / "models" / "hindi"
 
 
 def dtype_for_device(device: str) -> torch.dtype:
@@ -255,10 +255,16 @@ def write_results_csv(results: dict, output_path: Path) -> Path:
     return csv_path
 
 
+def _model_choice(value: str) -> str:
+    """Map the deprecated ``stage1`` label to ``finetuned``."""
+    return "finetuned" if value == "stage1" else value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["base", "stage1", "both"], default="both")
-    parser.add_argument("--checkpoint", default=str(STAGE1_ADAPTER))
+    parser.add_argument("--model", type=_model_choice, choices=["base", "finetuned", "both"], default="both",
+                        help="Which model to evaluate. 'stage1' is accepted as a deprecated alias for 'finetuned'.")
+    parser.add_argument("--checkpoint", default=str(FINETUNED_ADAPTER))
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--max-input-tokens", type=int, default=2048)
     parser.add_argument("--max-new-tokens", type=int, default=512)
@@ -300,10 +306,10 @@ def main() -> None:
         )
         release_model(model)
 
-    if args.model in {"stage1", "both"}:
+    if args.model in {"finetuned", "both"}:
         tokenizer, model, model_ref = load_lora_model(device, args.checkpoint)
-        results["models"]["stage1"] = evaluate_model(
-            "stage1",
+        results["models"]["finetuned"] = evaluate_model(
+            "finetuned",
             model_ref,
             tokenizer,
             model,

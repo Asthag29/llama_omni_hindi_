@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run IFEval-Hi through the lm-evaluation-harness fork.
+"""Run IFEval-Hi on the base model or the fine-tuned adapter (default: models/hindi) through the lm-evaluation-harness fork.
 
 Task example:
     Prompt: तीन वाक्यों में भारत के मानसून का वर्णन करें और हर वाक्य "मानसून" शब्द से शुरू करें।
@@ -17,15 +17,22 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASE_MODEL = REPO_ROOT / "models" / "llama"
-STAGE1_ADAPTER = REPO_ROOT / "outputs" / "stage_1" / "backbone_text" / "final_model"
+FINETUNED_ADAPTER = REPO_ROOT / "models" / "hindi"
 DEFAULT_OUTPUT = REPO_ROOT / "evaluations" / "results" / "if_eval_hi"
+
+
+def _model_choice(value: str) -> str:
+    """Map the deprecated ``stage1`` label to ``finetuned``."""
+    return "finetuned" if value == "stage1" else value
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["base", "stage1"], default="stage1")
+    parser.add_argument("--model", type=_model_choice, choices=["base", "finetuned"], default="finetuned",
+                        help="Which model to evaluate. 'stage1' is accepted as a deprecated alias for 'finetuned'.")
     parser.add_argument("--base-model", type=Path, default=BASE_MODEL)
-    parser.add_argument("--stage1-adapter", type=Path, default=STAGE1_ADAPTER)
+    parser.add_argument("--checkpoint", "--stage1-adapter", dest="checkpoint", type=Path, default=FINETUNED_ADAPTER,
+                        help="Fine-tuned LoRA adapter directory. '--stage1-adapter' is a deprecated alias.")
     parser.add_argument("--output-path", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--batch-size", default="16", help="lm-eval batch size. Use a smaller value if generation runs out of memory.")
     parser.add_argument("--limit", type=int, default=None, help="Optional smoke-test sample limit.")
@@ -45,8 +52,8 @@ def build_model_args(args: argparse.Namespace) -> str:
         "low_cpu_mem_usage=False",
         "device_map=None",
     ]
-    if args.model == "stage1":
-        parts.append(f"peft={args.stage1_adapter}")
+    if args.model == "finetuned":
+        parts.append(f"peft={args.checkpoint}")
     return ",".join(str(part) for part in parts)
 
 

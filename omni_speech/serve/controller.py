@@ -17,7 +17,7 @@ import requests
 import uvicorn
 
 from omni_speech.constants import CONTROLLER_HEART_BEAT_EXPIRATION
-from omni_speech.train_utils import build_logger, server_error_msg
+from omni_speech.serve.utils import build_logger, server_error_msg
 
 
 logger = build_logger("controller", "controller.log")
@@ -34,7 +34,7 @@ class DispatchMethod(Enum):
         elif name == "shortest_queue":
             return cls.SHORTEST_QUEUE
         else:
-            raise ValueError(f"Invalid dispatch method")
+            raise ValueError("Invalid dispatch method")
 
 
 @dataclasses.dataclass
@@ -128,29 +128,9 @@ class Controller:
             if norm < 1e-4:
                 return ""
             worker_speeds = worker_speeds / norm
-            if True:  # Directly return address
-                pt = np.random.choice(np.arange(len(worker_names)),
-                    p=worker_speeds)
-                worker_name = worker_names[pt]
-                return worker_name
-
-            # Check status before returning
-            while True:
-                pt = np.random.choice(np.arange(len(worker_names)),
-                    p=worker_speeds)
-                worker_name = worker_names[pt]
-
-                if self.get_worker_status(worker_name):
-                    break
-                else:
-                    self.remove_worker(worker_name)
-                    worker_speeds[pt] = 0
-                    norm = np.sum(worker_speeds)
-                    if norm < 1e-4:
-                        return ""
-                    worker_speeds = worker_speeds / norm
-                    continue
-            return worker_name
+            pt = np.random.choice(np.arange(len(worker_names)),
+                p=worker_speeds)
+            return worker_names[pt]
         elif self.dispatch_method == DispatchMethod.SHORTEST_QUEUE:
             worker_names = []
             worker_qlen = []
@@ -205,7 +185,7 @@ class Controller:
             for chunk in response.iter_lines(decode_unicode=False, delimiter=b"\0"):
                 if chunk:
                     yield chunk + b"\0"
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.RequestException:
             logger.info(f"worker timeout: {worker_addr}")
             ret = {
                 "text": server_error_msg,
