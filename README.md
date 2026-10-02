@@ -216,17 +216,34 @@ Hindi on text only; stage 2 then adds the speech projector.
 | Config | `configs/stage_1.yaml` | `configs/stage_2.yaml` |
 | Trainable | LLM LoRA | LLM LoRA + speech projector |
 | Frozen | Whisper, speech projector | Whisper |
-| Input | Hindi text conversations (local JSON) | Hindi speech + text, streamed from the HF dataset |
-| Init | `models/llama` | stage-1 `final_model` |
-| Output | `outputs/stage_1/backbone_text/final_model/` | `outputs/stage_2/speech_text/final_model/` |
+| Input | Hindi text conversations (local JSON) | Hindi speech clips of at most 30 s with text answers (local parquet) |
+| Init | `models/llama` | stage-1 `best_model` |
+| Output | `outputs/stage_1/backbone_text/` | `outputs/stage_2/speech_text/` |
 
 Shared hyperparameters (all in the YAML configs): LoRA `r=128`, `alpha=64`,
 `dropout=0.05` on all attention and MLP projections; learning rate `1.07e-4`
 with cosine schedule and 5% warmup; batch size 2 × 7 gradient-accumulation
-steps; 3 epochs; `bf16-mixed`; gradient checkpointing; gradient clipping at
-1.8. The published adapter was trained on a single H100: stage 1 ran its full
-19,683 optimizer steps in about 11 hours (on an earlier random 90/10 split); stage 2 is the checkpoint at step
-13,125 of a planned 22,500, where the job reached its 12-hour limit.
+steps; 3 epochs; gradient checkpointing; gradient clipping at 1.8. With
+`bf16-mixed` the frozen base model and the forward pass are bf16, while the
+trainable LoRA and projector weights and the optimizer state are kept in
+fp32, so small updates are not rounded away. That costs about 3 GB of extra
+GPU memory; peak use is about 26 GB at these settings.
+
+Each run writes to its output directory:
+
+- `checkpoints/best`: the best weights so far by validation loss, present from
+  the first validation, so a job that is killed still leaves usable weights.
+- `best_model/` and `final_model/` once training completes: the best and the
+  last weights. Each holds `adapter_config.json`, `adapter_model.safetensors`,
+  `speech_projector.safetensors`, and `checkpoint_meta.json` (about 1.4 GB).
+- `logs/train.log` and `csv/metrics.csv`: training loss averaged over the
+  optimizer steps since the previous row, validation loss, and learning rate,
+  written at every validation and every 500 steps in between.
+
+The adapter currently published was trained before these changes, on a single
+H100: stage 1 ran 19,683 optimizer steps in about 11 hours on an earlier
+random 90/10 split, and stage 2 is the checkpoint at step 13,125 of a planned
+22,500, where the job reached its 12-hour limit.
 
 Both stages log to Weights & Biases by default (`logging.wandb: true`,
 project `hindi_llama_omni`). Run `wandb login` first or pass
@@ -270,26 +287,52 @@ data module's `test_dataloader()` for a final `trainer.test` run.
 
 #### Stage 2: speech projector + backbone
 
-Stage 2 streams parquet shards directly from the
+Whisper hears only the first 30 seconds of a clip, and in the
 [`Pastaaaaa2003/Hindi-speech-instruct`](https://huggingface.co/datasets/Pastaaaaa2003/Hindi-speech-instruct)
-dataset (105,000 train / 5,720 validation samples; see `streaming.*` in
-`configs/stage_2.yaml`), so no local audio download is needed. Each row holds
-the spoken question, its text, and the text answer; mel features (128 bins)
-are computed on the fly. It initializes from the stage-1 adapter
-(`model.init_checkpoint`).
+dataset about half of the spoken questions are longer than that. Stage 2
+therefore trains on a local copy that keeps only clips of at most 30 s whose
+question is also in the stage-1 file, split with the same ids as stage 1.
+Build it once:
+
+```bash
+python -m omni_speech.datasets.processing.build_stage2_local   # -> data/speech/
+```
+
+The job downloads one source file at a time into `/tmp`, keeps the usable
+rows, and deletes the source file, so only the result (about 9 GB) lands on
+disk. It uses about 0.5 GB of memory, takes roughly 20–40 minutes, and resumes
+if interrupted. For the data used here it keeps 49,787 clips (160 hours):
+
+| Source | Train | Validation | Test |
+| --- | ---: | ---: | ---: |
+| LMSYS | 19,790 | 2,525 | 2,505 |
+| Flan v2 | 12,949 | 1,618 | 1,616 |
+| Anudesh | 5,810 | 725 | 730 |
+| HH-RLHF | 1,218 | 151 | 150 |
+| **Total** | **39,767** | **5,019** | **5,001** |
+
+Then train:
 
 ```bash
 python -m omni_speech.training.stage2
 ```
 
-`final_model/` contains `adapter_config.json`, `adapter_model.safetensors`,
-`speech_projector.safetensors`, and `checkpoint_meta.json`. Copy it to
-`models/hindi/` to serve it.
+Stage 2 reads `data/speech/` (`streaming.data_dir`), takes its sample counts
+and learning-rate schedule from `data/speech/manifest.json` (8,523 optimizer
+steps for the data above), and stops with a clear message if the directory has
+not been built. It starts from stage 1's `best_model`
+(`model.init_checkpoint`) and uses the same instruction prompt as inference,
+`DEFAULT_SPEECH_PROMPT` in `omni_speech/constants.py`. Mel features (128 bins)
+are computed on the fly. Setting `streaming.data_dir=null` streams from the
+Hub instead; clips over 30 s are then skipped as they are read.
 
-#### Combined: local speech-text data
+Copy `outputs/stage_2/speech_text/best_model/` to `models/hindi/` to serve
+the result.
+
+#### Combined: local FLAC files
 
 `omni_speech.training.combined` (`configs/combined.yaml`) trains the same
-modules as stage 2 but from a local manifest instead of streaming:
+modules as stage 2 from a JSON manifest and individual audio files:
 `data/datasets.json` with `{"speech": "<file>.flac", "conversations": [...]}`
 entries and audio under `data/flac/`. Use it when you have your own
 speech-instruction data on disk.
