@@ -1,4 +1,5 @@
 import argparse
+import html
 import json
 import os
 import time
@@ -84,10 +85,30 @@ def load_demo_refresh_model_list(request: gr.Request):
     return state, dropdown_update
 
 
+IDLE_STATUS = "Ask a question to get a spoken answer. · सवाल पूछें, जवाब यहाँ आएगा।"
+WORKER_DOWN_MSG = "The model worker is not responding. Check that it is running, then try again."
+UNEXPECTED_ERROR_MSG = "Something went wrong while answering. Please try again."
+
+
+def render_status(message, kind="progress"):
+    """Status line HTML; kind is one of "idle", "progress", "error"."""
+    if not message:
+        return ""
+    return f'<div class="status status-{kind}" role="status">{html.escape(message)}</div>'
+
+
+def ask_button(enabled):
+    return gr.Button(interactive=enabled)
+
+
+def start_request():
+    return (ask_button(False), render_status("Uploading your question…"), "", None)
+
+
 def clear_history(request: gr.Request):
     logger.info(f"clear_history. ip: {request.client.host}")
     state = default_conversation.copy()
-    return (state, None, "", "", None)
+    return (state, None, render_status(IDLE_STATUS, "idle"), "", None, ask_button(True))
 
 
 def normalize_audio(audio):
@@ -132,12 +153,26 @@ def add_speech(state, speech, request: gr.Request):
 
 
 def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request: gr.Request):
+    """Yields (state, status_html, answer_text, answer_audio, ask_button_update).
+
+    Every terminal yield re-enables the Ask button.
+    """
     logger.info(f"http_bot. ip: {request.client.host}")
+    try:
+        yield from _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens)
+    except Exception as exc:
+        logger.exception(f"http_bot failed: {exc}")
+        yield (state, render_status(UNEXPECTED_ERROR_MSG, "error"), gr.skip(), None, ask_button(True))
+
+
+def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
     model_name = model_selector
+    busy = gr.skip()
 
     if state.skip_next:
         # This generate call is skipped due to invalid inputs
-        yield (state, "Please record or upload a Hindi question first.", "", None)
+        yield (state, render_status("Please record or upload a Hindi question first.", "error"),
+               "", None, ask_button(True))
         return
 
     if len(state.messages) == state.offset + 2:
@@ -150,15 +185,19 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request:
 
     # Query worker address
     controller_url = args.controller_url
-    ret = requests.post(controller_url + "/get_worker_address",
-            json={"model": model_name})
-    worker_addr = ret.json()["address"]
+    try:
+        ret = requests.post(controller_url + "/get_worker_address",
+                json={"model": model_name}, timeout=10)
+        worker_addr = ret.json()["address"]
+    except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+        logger.error(f"Controller request failed ({controller_url}): {e}")
+        worker_addr = ""
     logger.info(f"model_name: {model_name}, worker_addr: {worker_addr}")
 
     # No available worker
     if worker_addr == "":
         state.messages[-1][-1] = server_error_msg
-        yield (state, server_error_msg, "", None)
+        yield (state, render_status(WORKER_DOWN_MSG, "error"), "", None, ask_button(True))
         return
 
     # Construct prompt
@@ -186,8 +225,8 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request:
         "audio": audio,
     }
 
-    thinking_status = "Listening and thinking…"
-    yield (state, thinking_status, "", None)
+    thinking_status = render_status("Listening and thinking…")
+    yield (state, thinking_status, "", None, busy)
 
     try:
         # Stream output
@@ -201,56 +240,99 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request:
                     output = data["text"][len(prompt):].strip()
                     state.messages[-1][-1] = output
 
-                    yield (state, thinking_status, output, None)
+                    yield (state, thinking_status, output, None, busy)
                 else:
                     output = data["text"] + f" (error_code: {data['error_code']})"
                     state.messages[-1][-1] = output
-                    yield (state, f"{server_error_msg} (error_code: {data['error_code']})", "", None)
+                    logger.error(f"Worker returned error_code {data['error_code']}: {data['text']}")
+                    yield (state, render_status(
+                        f"The model could not answer this question (error code {data['error_code']}). "
+                        "Please try again.", "error"), "", None, ask_button(True))
                     return
                 time.sleep(0.03)
     except requests.exceptions.RequestException as e:
         logger.error(f"Worker request failed: {e}")
         state.messages[-1][-1] = server_error_msg
-        yield (state, server_error_msg, "", None)
+        yield (state, render_status(WORKER_DOWN_MSG, "error"), "", None, ask_button(True))
         return
 
-    yield (state, "Generating speech…", output, None)
+    yield (state, render_status("Generating speech…"), output, None, busy)
 
     return_value = synthesize_with_indicf5(output, ref_audio_path, ref_text)
     if return_value is None:
-        yield (state, "Speech synthesis failed; see the server log.", output, None)
+        yield (state, render_status(
+            "The text answer is ready, but speech could not be generated.", "error"),
+            output, None, ask_button(True))
     else:
-        yield (state, "", output, return_value)
+        yield (state, "", output, return_value, ask_button(True))
 
     logger.info(f"{output}")
     logger.info(f"IndicF5 reference transcript: {ref_text}")
 
 
-title_markdown = ("""
-# 🦙🎧 Hindi LLaMA-Omni
-Record or upload a Hindi question and get a spoken Hindi answer.  ·  हिंदी में सवाल पूछें, जवाब आवाज़ में पाएँ।
-""")
+title_html = """
+<div id="header">
+  <h1>🦙🎧 Hindi LLaMA-Omni</h1>
+  <p>Record or upload a Hindi question and get a spoken Hindi answer.</p>
+  <p lang="hi">हिंदी में सवाल पूछें, जवाब आवाज़ में पाएँ।</p>
+  <nav class="links">
+    <a href="https://huggingface.co/Pastaaaaa2003/hindi-llama-omni-model" target="_blank" rel="noopener">Model</a>
+    <a href="https://huggingface.co/datasets/Pastaaaaa2003/Hindi-speech-instruct" target="_blank" rel="noopener">Dataset</a>
+    <a href="https://github.com/Asthag29/llama_omni_hindi_" target="_blank" rel="noopener">Code</a>
+    <a href="https://github.com/ictnlp/LLaMA-Omni" target="_blank" rel="noopener">Base model: LLaMA-Omni</a>
+  </nav>
+</div>
+"""
+
+footer_html = """
+<div id="footer">
+  Built on LLaMA-Omni, Whisper large-v3, and IndicF5.
+  Answers are generated by a model and may be wrong.
+</div>
+"""
 
 block_css = """
-
-#buttons button {
-    min-width: min(120px,100%);
+.gradio-container { max-width: 1100px !important; margin: 0 auto !important; }
+#header { text-align: center; padding: 12px 0 4px; }
+#header h1 { margin: 0 0 6px; font-size: 2rem; color: var(--body-text-color); }
+#header p { margin: 2px 0; color: var(--body-text-color-subdued); }
+#header .links { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 12px; }
+#header .links a {
+    padding: 3px 12px; border: 1px solid var(--border-color-primary); border-radius: 999px;
+    background: var(--background-fill-secondary); color: var(--body-text-color);
+    font-size: var(--text-sm); text-decoration: none;
 }
-
+#header .links a:hover { border-color: var(--color-accent); color: var(--color-accent); }
+.panel-heading h3 { margin: 0 !important; }
+#buttons button { min-width: min(120px, 100%); }
+.status {
+    padding: 8px 12px; border-radius: var(--radius-lg); font-size: var(--text-md);
+    border: 1px solid var(--border-color-primary); border-left: 4px solid var(--color-accent);
+    background: var(--background-fill-secondary); color: var(--body-text-color);
+}
+.status-idle { border-left-color: var(--border-color-primary); color: var(--body-text-color-subdued); }
+.status-error {
+    border-color: var(--error-border-color); border-left-color: var(--error-text-color);
+    background: var(--error-background-fill); color: var(--error-text-color);
+}
+#answer textarea { font-size: 1.2rem; line-height: 1.8; }
+#footer { text-align: center; font-size: var(--text-sm); color: var(--body-text-color-subdued); padding: 8px 0; }
 """
+
 
 def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
     with gr.Blocks(title="Hindi LLaMA-Omni", theme=gr.themes.Soft(), css=block_css) as demo:
         state = gr.State()
 
         if not embed_mode:
-            gr.Markdown(title_markdown)
+            gr.HTML(title_html)
 
         if cur_dir is None:
             cur_dir = os.path.dirname(os.path.abspath(__file__))
 
-        with gr.Row():
-            with gr.Column(scale=1):
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=1, min_width=320, variant="panel"):
+                gr.Markdown("### 1 · Ask your question", elem_classes="panel-heading")
                 audio_input_box = gr.Audio(
                     sources=["upload", "microphone"],
                     label="Your question (Hindi)",
@@ -261,7 +343,7 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
                         [f"{cur_dir}/examples/example2.wav"],
                     ],
                     inputs=[audio_input_box],
-                    label="Try an example",
+                    label="Or try an example, then press Ask",
                 )
                 with gr.Row(elem_id="buttons"):
                     submit_btn = gr.Button(value="Ask", variant="primary")
@@ -282,28 +364,46 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
                         interactive=False,
                     )
 
-            with gr.Column(scale=1):
-                status_box = gr.Markdown("")
-                text_output_box = gr.Textbox(label="Answer (text)", lines=6, interactive=False)
+            with gr.Column(scale=1, min_width=320, variant="panel"):
+                gr.Markdown("### 2 · Answer", elem_classes="panel-heading")
+                status_box = gr.HTML(render_status(IDLE_STATUS, "idle"), elem_id="status")
+                text_output_box = gr.Textbox(
+                    label="Answer (text)", lines=6, interactive=False,
+                    show_copy_button=True, elem_id="answer",
+                )
                 audio_output_box = gr.Audio(label="Answer (speech)", autoplay=True, interactive=False)
+
+        if not embed_mode:
+            gr.HTML(footer_html)
 
         url_params = gr.JSON(visible=False)
 
         submit_btn.click(
+            start_request,
+            None,
+            [submit_btn, status_box, text_output_box, audio_output_box],
+            queue=False
+        ).then(
             add_speech,
             [state, audio_input_box],
             [state]
         ).then(
             http_bot,
             [state, model_selector, temperature, top_p, max_output_tokens],
-            [state, status_box, text_output_box, audio_output_box],
+            [state, status_box, text_output_box, audio_output_box, submit_btn],
             concurrency_limit=concurrency_count
+        ).then(
+            # Safety net: .then runs even if a previous step failed.
+            lambda: ask_button(True),
+            None,
+            [submit_btn],
+            queue=False
         )
 
         clear_btn.click(
             clear_history,
             None,
-            [state, audio_input_box, status_box, text_output_box, audio_output_box],
+            [state, audio_input_box, status_box, text_output_box, audio_output_box, submit_btn],
             queue=False
         )
 
