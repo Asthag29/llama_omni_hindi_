@@ -351,7 +351,11 @@ def build_callbacks(cfg: DictConfig, has_validation: bool):
     callbacks = [
         checkpoint_callback,
         LearningRateMonitor(logging_interval="step"),
-        LocalMetricsLogCallback(log_path=log_path, csv_path=csv_path),
+        LocalMetricsLogCallback(
+            log_path=log_path,
+            csv_path=csv_path,
+            every_n_steps=int(cfg.logging.get("local_log_every_n_steps", 500)),
+        ),
     ]
     if bool(cfg.logging.get("save_resume_state", False)):
         resume_dir = os.path.join(
@@ -362,7 +366,7 @@ def build_callbacks(cfg: DictConfig, has_validation: bool):
     return callbacks
 
 
-# --- Training log (stdlib logging) ---
+# --- Local metrics table (logs/train.log + csv/metrics.csv) ---
 
 def format_metrics_table(headers, rows):
     widths = [len(str(h)) for h in headers]
@@ -380,74 +384,38 @@ def format_metrics_table(headers, rows):
     return "\n".join(lines)
 
 
-def setup_training_log(log_path: str):
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-
-    logger = logging.getLogger(f"training_metrics:{os.path.abspath(log_path)}")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    if not logger.handlers:
-        handler = logging.FileHandler(log_path, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
-        logger.addHandler(handler)
-
-    class _LoggerAdapter:
-        def info(self, message, *args):
-            if args:
-                message = message.format(*args)
-            logger.info(message)
-
-    return _LoggerAdapter()
-
-
 class LocalMetricsLogCallback(Callback):
-    """Text logs plus epoch CSV metrics."""
+    """Write a local metrics table to ``train.log`` and ``metrics.csv`` (rank 0 only).
 
-    LOG_HEADERS = ("epoch", "step", "train_loss_epoch", "val_loss", "lr")
-    SUMMARY_HEADERS = ("epoch", "train_loss_epoch", "val_loss")
-    CSV_HEADERS = ("epoch", "lr", "train_loss", "val_loss")
+    Each row summarises a *window* of optimizer steps: the steps completed since the
+    previous row (or since the start of the fit). ``train_loss`` is the unweighted mean
+    of ``train_loss_accum`` over the optimizer steps in the window, where
+    ``train_loss_accum`` is the module's per-optimizer-step loss (mean of the
+    gradient-accumulation micro-batch losses of that step, averaged over ranks).
+    ``train_steps_in_window`` is the number of optimizer steps in that mean.
 
-    def __init__(self, log_path: str, csv_path: str | None = None):
+    Rows are written:
+      * after every real validation (``val_loss`` filled; sanity checks are skipped),
+      * every ``every_n_steps`` optimizer steps if no validation ran at that step
+        (training-only row, empty ``val_loss``),
+      * at the end of a completed training epoch if steps remain in the window.
+    ``step`` is ``trainer.global_step``; ``lr`` is the learning rate of the first
+    param group used by the last optimizer step of the window.
+    """
+
+    TRAIN_LOSS_KEY = "train_loss_accum"
+    VAL_LOSS_KEY = "val_loss"
+    HEADERS = ("epoch", "step", "train_loss", "train_steps_in_window", "val_loss", "lr")
+
+    def __init__(self, log_path: str, csv_path: str | None = None, every_n_steps: int = 500):
         self.log_path = log_path
         self.csv_path = csv_path
-        self.epoch_records = {}
-        self._logger = None
-
-    def _write_epoch_csv(self) -> None:
-        if not self.csv_path:
-            return
-        os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
-        with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(self.CSV_HEADERS)
-            for _, record in sorted(self.epoch_records.items()):
-                writer.writerow([
-                    record["epoch"],
-                    "" if record["lr"] is None else record["lr"],
-                    "" if record["train_loss"] is None else record["train_loss"],
-                    "" if record["val_loss"] is None else record["val_loss"],
-                ])
-
-    def _write_epoch_log(self) -> None:
-        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
-        rows = []
-        for _, record in sorted(self.epoch_records.items()):
-            rows.append([
-                record["epoch"],
-                record["step"],
-                self._fmt(record["train_loss"]),
-                self._fmt(record["val_loss"]),
-                self._fmt(record["lr"], digits=9),
-            ])
-        with open(self.log_path, "w", encoding="utf-8") as f:
-            f.write("Training log\n")
-            f.write(format_metrics_table(self.LOG_HEADERS, rows))
-            f.write("\n")
-
-    def _logger_instance(self):
-        if self._logger is None:
-            self._logger = setup_training_log(self.log_path)
-        return self._logger
+        self.every_n_steps = int(every_n_steps)
+        self.rows = []
+        self._window = []
+        self._last_step = 0
+        self._last_lr = None
+        self._row_due = False
 
     @staticmethod
     def _metric(trainer, key: str):
@@ -457,12 +425,11 @@ class LocalMetricsLogCallback(Callback):
         return float(value.detach().cpu()) if isinstance(value, torch.Tensor) else float(value)
 
     @staticmethod
-    def _current_lr(trainer):
-        optimizers = getattr(trainer, "optimizers", None)
+    def _optimizer_lr(trainer):
+        optimizers = trainer.optimizers
         if not optimizers:
             return None
-        optimizer = optimizers[0] if isinstance(optimizers, list) else optimizers
-        return float(optimizer.param_groups[0]["lr"])
+        return float(optimizers[0].param_groups[0]["lr"])
 
     @staticmethod
     def _fmt(value, digits=4):
@@ -472,55 +439,127 @@ class LocalMetricsLogCallback(Callback):
             return f"{value:.{digits}f}"
         return str(value)
 
-    def _record_epoch(self, trainer) -> None:
-        if trainer.global_rank != 0:
-            return
+    @staticmethod
+    def _csv_cell(value):
+        return "" if value is None else value
 
-        train_loss = self._metric(trainer, "train_loss_epoch")
-        val_loss = self._metric(trainer, "val_loss")
-        lr = self._metric(trainer, "lr-AdamW") or self._current_lr(trainer)
-        if train_loss is None and val_loss is None:
-            return
+    def _write_csv_header(self) -> None:
+        os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
+        with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(self.HEADERS)
 
-        epoch = trainer.current_epoch
-        key = (epoch, trainer.global_step)
-        existing = self.epoch_records.get(key, {})
-        self.epoch_records[key] = {
-            "epoch": epoch,
+    def _append_csv_row(self, row) -> None:
+        with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([self._csv_cell(row[h]) for h in self.HEADERS])
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _load_existing_csv_rows(self) -> bool:
+        """On resume, keep the rows of the interrupted run if the CSV has our header."""
+        if not self.csv_path or not os.path.isfile(self.csv_path):
+            return False
+        with open(self.csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if tuple(reader.fieldnames or ()) != self.HEADERS:
+                return False
+            self.rows = [
+                {key: (None if value == "" else value) for key, value in row.items()}
+                for row in reader
+            ]
+        return True
+
+    def _write_log_table(self) -> None:
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+        table_rows = [
+            [
+                row["epoch"],
+                row["step"],
+                self._fmt(row["train_loss"]),
+                row["train_steps_in_window"],
+                self._fmt(row["val_loss"]),
+                self._fmt(row["lr"], digits=9),
+            ]
+            for row in self.rows
+        ]
+        tmp_path = self.log_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write("Training log\n")
+            f.write(
+                f"train_loss = mean of per-optimizer-step {self.TRAIN_LOSS_KEY} over the "
+                "train_steps_in_window optimizer steps since the previous row\n"
+            )
+            f.write(format_metrics_table(self.HEADERS, table_rows))
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self.log_path)
+
+    def _emit_row(self, trainer, val_loss=None) -> None:
+        window = self._window
+        row = {
+            "epoch": trainer.current_epoch,
             "step": trainer.global_step,
-            "lr": lr if lr is not None else existing.get("lr"),
-            "train_loss": train_loss if train_loss is not None else existing.get("train_loss"),
-            "val_loss": val_loss if val_loss is not None else existing.get("val_loss"),
+            "train_loss": sum(window) / len(window) if window else None,
+            "train_steps_in_window": len(window),
+            "val_loss": val_loss,
+            "lr": self._last_lr if self._last_lr is not None else self._optimizer_lr(trainer),
         }
-        self._write_epoch_log()
-        self._write_epoch_csv()
+        self._window = []
+        self._row_due = False
+        self.rows.append(row)
+        if self.csv_path:
+            self._append_csv_row(row)
+        self._write_log_table()
 
     def on_fit_start(self, trainer, pl_module) -> None:
-        if trainer.global_rank != 0 or not self.csv_path:
+        self.rows = []
+        self._window = []
+        self._last_lr = None
+        self._row_due = False
+        if trainer.global_rank != 0:
             return
-        self.epoch_records = {}
-        self._write_epoch_log()
-        self._write_epoch_csv()
+        resumed = bool(trainer.ckpt_path) and self._load_existing_csv_rows()
+        if self.csv_path and not resumed:
+            self._write_csv_header()
+        self._write_log_table()
+
+    def on_train_start(self, trainer, pl_module) -> None:
+        # Runs after a resume checkpoint has restored global_step.
+        self._last_step = trainer.global_step
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:
+        # A periodic row is written one batch late so that a validation running at the
+        # same step can claim the window instead (its row then carries the train loss).
+        if trainer.global_rank == 0 and self._row_due and self._window:
+            self._emit_row(trainer)
+        self._row_due = False
+
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer) -> None:
+        # Lightning steps "interval: step" schedulers before on_train_batch_end, so the
+        # LR the step actually uses must be read here.
+        self._last_lr = float(optimizer.param_groups[0]["lr"])
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        if trainer.global_step == self._last_step:
+            return  # gradient-accumulation micro-batch, no optimizer step
+        self._last_step = trainer.global_step
+        if trainer.global_rank != 0:
+            return
+        train_loss = self._metric(trainer, self.TRAIN_LOSS_KEY)
+        if train_loss is not None:
+            self._window.append(train_loss)
+        if self.every_n_steps > 0 and trainer.global_step % self.every_n_steps == 0:
+            self._row_due = True
 
     def on_validation_epoch_end(self, trainer, pl_module) -> None:
-        self._record_epoch(trainer)
+        if trainer.global_rank != 0 or trainer.sanity_checking or trainer.state.fn != "fit":
+            return
+        self._emit_row(trainer, val_loss=self._metric(trainer, self.VAL_LOSS_KEY))
 
     def on_train_epoch_end(self, trainer, pl_module) -> None:
-        if getattr(trainer, "num_val_dataloaders", 0) > 0:
-            return
-        self._record_epoch(trainer)
+        if trainer.global_rank == 0 and self._window:
+            self._emit_row(trainer)
 
-    def on_fit_end(self, trainer, pl_module) -> None:
-        if trainer.global_rank != 0 or not self.epoch_records:
-            return
-        summary_rows = []
-        for _, record in sorted(self.epoch_records.items()):
-            summary_rows.append([
-                record["epoch"],
-                self._fmt(record["train_loss"]),
-                self._fmt(record["val_loss"]),
-            ])
-        self._logger_instance().info(
-            "Metrics (train / val per epoch)\n{}",
-            format_metrics_table(self.SUMMARY_HEADERS, summary_rows),
-        )
+    def on_train_end(self, trainer, pl_module) -> None:
+        if trainer.global_rank == 0 and self._window:
+            self._emit_row(trainer)
