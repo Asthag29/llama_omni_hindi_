@@ -16,8 +16,26 @@ class ConfigValidationTests(unittest.TestCase):
         with (CONFIG_DIR / f"{name}.yaml").open(encoding="utf-8") as file:
             return yaml.safe_load(file)
 
-    def test_only_the_two_stage_configs_exist(self):
-        self.assertEqual(sorted(p.stem for p in CONFIG_DIR.glob("*.yaml")), list(CONFIG_NAMES))
+    def test_only_the_known_configs_exist(self):
+        self.assertEqual(
+            sorted(p.stem for p in CONFIG_DIR.glob("*.yaml")),
+            ["speech_only", "stage_1", "stage_2"],
+        )
+
+    def test_speech_only_is_stage_2_without_an_init_checkpoint(self):
+        with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
+            stage_2 = OmegaConf.to_container(compose(config_name="stage_2"))
+            speech_only = OmegaConf.to_container(compose(config_name="speech_only"))
+
+        self.assertIsNone(speech_only["model"]["init_checkpoint"])
+        self.assertNotEqual(
+            speech_only["logging"]["output_dir"], stage_2["logging"]["output_dir"]
+        )
+        for config in (stage_2, speech_only):
+            config["model"].pop("init_checkpoint")
+            config["logging"].pop("output_dir")
+            config["logging"].pop("wandb_run_name")
+        self.assertEqual(speech_only, stage_2)
 
     def test_training_configs_keep_required_model_paths(self):
         for name in CONFIG_NAMES:

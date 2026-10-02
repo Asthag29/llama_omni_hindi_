@@ -1,0 +1,14 @@
+# Single-stage training: speech in, text out, with no stage-1 text training.
+# Same data, model and settings as stage_2.yaml, but the LoRA adapter starts
+# from scratch on the base model instead of from a stage-1 checkpoint.
+#   python -m omni_speech.training.stage2 --config-name speech_only
+defaults:
+  - stage_2
+  - _self_
+
+model:
+  init_checkpoint: null
+
+logging:
+  output_dir: "outputs/speech_only/speech_text"
+  wandb_run_name: "speech-only"
