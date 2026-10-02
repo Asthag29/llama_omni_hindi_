@@ -1,7 +1,5 @@
 import copy
-import json
 import os
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import hydra
@@ -15,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler, Subset, random_split
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from omni_speech.constants import IGNORE_INDEX
+from omni_speech.datasets.json_utils import load_json_array_maybe_prefixed
 from omni_speech.datasets.preprocess import preprocess
 from omni_speech.model.language_model.omni_speech_llama import (
     OmniSpeechConfig,
@@ -27,15 +26,6 @@ from omni_speech.train_utils import (
     optional_abs_path,
     save_omni_speech_checkpoint,
 )
-
-
-def load_json_array_maybe_prefixed(path: str) -> List[Dict]:
-    text = Path(path).read_text(encoding="utf-8")
-    start = text.find("[")
-    end = text.rfind("]")
-    if start == -1 or end == -1 or end < start:
-        raise ValueError(f"Could not locate a JSON array in {path}")
-    return json.loads(text[start : end + 1])
 
 
 class TextConversationDataset(Dataset):

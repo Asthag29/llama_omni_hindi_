@@ -9,7 +9,6 @@ class EncoderProjectorConcat(nn.Module):
         super().__init__()
         self.k = config.speech_encoder_ds_rate #* downsampling rate of the speech encoder
         self.encoder_dim = config.speech_encoder_hidden_size
-        self.llm_dim = config.hidden_size
         self.linear1 = nn.Linear(self.encoder_dim * self.k, 2048)
         self.relu = nn.ReLU()
         self.linear2 = nn.Linear(2048, config.hidden_size)

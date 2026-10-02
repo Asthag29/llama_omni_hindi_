@@ -1,19 +1,16 @@
 *.pyc
-llama_omni.egg-info/
+*.egg-info/
+*.log
 models/
-vocoder/
-experiment.ipynb
 My_learning.md
 sample_data/
 .gradio/
 
 checkpoints/
 experiments/
-indic.py
 FINAL_REPORT.md
 logs/
 outputs/
-
 
 delete_folder/
 
@@ -28,7 +25,6 @@ __pycache__/
 
 # Generated evaluation outputs.
 evaluations/results/*.json
-!evaluations/results/speech_streaming_validation.json
 
 scripts/
 shortcuts.sh
@@ -36,17 +32,9 @@ new.md
 
 audio/
 
-data/instruct
-data/datasets.json
-
-data/instruct
-
-
-data/datasets.json
-scripts/
 data/instruct/
 data/datasets.json
-delete_folder/
+
 images/image_1.png
 images/image_2.png
 images/image_3.png
@@ -56,5 +44,4 @@ images/image_6.png
 images/image_7.png
 images/image_8.png
 
-scripts/
 hindi_ckpt/

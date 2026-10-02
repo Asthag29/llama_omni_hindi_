@@ -2,8 +2,9 @@ data:
   seed: 42
   input_type: "mel"
   mel_size: 128
-  # Keep streaming workers at 0 by default. Multiple workers can duplicate HF
-  # stream reads because each worker must skip rows assigned to other workers.
+  # Each streaming worker reads the HF stream and skips rows assigned to other
+  # workers, so more workers mean more duplicated stream reads. Lower to 0 if
+  # stream I/O becomes the bottleneck.
   num_workers: 2
   prefetch_factor: 2
   persistent_workers: true

@@ -1,8 +1,7 @@
-"""Train OmniSpeech directly from Hugging Face parquet streaming.
+"""Stage-2 OmniSpeech training over Hugging Face-streamed parquet speech data.
 
-This path is intentionally separate from trainer.py and trainer_shard.py. It
-does not materialize FLAC files to disk; audio bytes are decoded from streamed
-parquet rows in the dataloader.
+Audio is never materialized as FLAC files on disk; audio bytes are decoded
+from streamed parquet rows in the dataloader.
 """
 
 from __future__ import annotations

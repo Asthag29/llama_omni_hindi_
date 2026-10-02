@@ -31,45 +31,8 @@ class OmniSpeechMetaModel:
             self.speech_encoder = build_speech_encoder(config)
             self.speech_projector = build_speech_projector(config)
 
-## todo: why is this needed? 
     def get_speech_encoder(self):
-        speech_encoder = getattr(self, 'speech_encoder', None)
-        if type(speech_encoder) is list:
-            speech_encoder = speech_encoder[0] #!used for multigpu training, 
-        return speech_encoder
-## todo: need to loook into model arguments
-## todo: fdps is related to multigpu data parallelism(fully sharded data parallelism)
-    def initialize_speech_modules(self, model_args, fsdp=None):
-        self.config.speech_encoder = getattr(model_args, "speech_encoder", None) #* it is the checkpoint path for the speech encoder
-        self.config.speech_encoder_type = getattr(model_args, "speech_encoder_type", None) #* name of the model type like whisper, etc.
-        self.config.speech_projector_type = getattr(model_args, 'speech_projector_type', 'linear') #* can make nonlinear as well, if we write code for it
-        self.config.speech_encoder_ds_rate = getattr(model_args, 'speech_encoder_ds_rate', 5)
-        self.config.speech_encoder_hidden_size = getattr(model_args, 'speech_encoder_hidden_size', 1280)
-
-        #* just guards against the fallback to none
-        if self.get_speech_encoder() is None:
-            speech_encoder = build_speech_encoder(self.config)
-            if fsdp is not None and len(fsdp) > 0:
-                self.speech_encoder = [speech_encoder]  #*making it a list for multigpu training
-            else:
-                self.speech_encoder = speech_encoder
-
-        if getattr(self, 'speech_projector', None) is None:
-            self.speech_projector = build_speech_projector(self.config)
-        else:
-            # In case it is frozen by LoRA
-            ## todo: might be useful for later training stage
-            for p in self.speech_projector.parameters():
-                p.requires_grad = True  #*unfreezing the speech projector
-
-        #* loading the weights for the speech projector
-        if model_args.pretrain_speech_projector is not None:
-            pretrain_speech_projector_weights = torch.load(model_args.pretrain_speech_projector, map_location='cpu')
-            ## todo: need to understand this later
-            def get_w(weights, keyword):
-                return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k} #* returns a dictionary
-
-            self.speech_projector.load_state_dict(get_w(pretrain_speech_projector_weights, 'speech_projector')) #* essentially removing the name speech_encoder from the weights
+        return getattr(self, 'speech_encoder', None)
 
 #! class doing the actual processing of the speech and text
 #* whoever inherits from this class, must implement the get_model method
@@ -148,8 +111,7 @@ class OmniSpeechMetaForCausalLM(ABC):
         #* attention_mask: which positions are real vs padding.
         #* position_ids tells LLaMA the position number of each real embedding in the sequence. LLaMA uses positional information, via rotary position embeddings, so the model needs to know: “this is token/frame position 0, this is position 1, etc.”
 
-        # remove the padding using attention_mask -- FIXME
-        _input_ids = input_ids
+        # remove the padding using attention_mask
         input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
         labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
 

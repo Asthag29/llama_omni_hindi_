@@ -15,7 +15,7 @@
 
 import dataclasses
 from enum import auto, Enum
-from typing import List, Any, Union
+from typing import List
 
 
 class SeparatorStyle(Enum):
@@ -34,13 +34,6 @@ class Conversation:
     sep: str = "###"
     sep2: str = None
     version: str = "Unknown"
-
-    tokenizer_id: str = ""
-    tokenizer: Any = None
-    # Stop criteria (the default one is EOS token)
-    stop_str: Union[str, List[str]] = None
-    # Stops generation if meeting any token in this list
-    stop_token_ids: List[int] = None
 
     skip_next: bool = False
 
@@ -84,19 +77,6 @@ class Conversation:
     def append_message(self, role, message):
         self.messages.append([role, message])
     
-    def to_gradio_chatbot(self):
-        ret = []
-        for i, (role, msg) in enumerate(self.messages[self.offset:]):
-            if i % 2 == 0:
-                if type(msg) is tuple:
-                    msg, speech = msg
-                    ret.append([msg, None])
-                else:
-                    ret.append([msg, None])
-            else:
-                ret[-1][-1] = msg
-        return ret
-
     def copy(self):
         return Conversation(
             system=self.system,
@@ -108,18 +88,6 @@ class Conversation:
             sep2=self.sep2,
             version=self.version)
 
-    def dict(self):
-        return {
-            "system": self.system,
-            "roles": self.roles,
-            "messages": [
-                [role, message[0] if isinstance(message, tuple) else message]
-                for role, message in self.messages
-            ],
-            "offset": self.offset,
-            "sep": self.sep,
-            "sep2": self.sep2,
-        }
 
 conv_llama_3 = Conversation(
     system="आप एक सहायक भाषा और वाणी सहायक हैं। "

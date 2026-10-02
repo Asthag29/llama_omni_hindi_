@@ -17,26 +17,15 @@
 
 #! Training data pipeline: JSON conversations → Llama prompt strings → token IDs + masked labels.
 #! Primary path for this repo: preprocess() → preprocess_llama_3() (default_conversation = conv_llama_3).
-#! Inference only uses tokenizer_speech_token() from this file (see infer/infer.py).
+#! Inference only uses tokenizer_speech_token() from this file (see infer/inference.py and serve/model_worker.py).
 
-import copy
 import torch
 import transformers
-import tokenizers
 
 from typing import Dict, Sequence
 
 from omni_speech.constants import IGNORE_INDEX, DEFAULT_SPEECH_TOKEN, SPEECH_TOKEN_INDEX
 from omni_speech import conversation as conversation_lib
-
-from packaging import version
-
-IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
-
-# # Model Constants
-# IGNORE_INDEX = -100
-# SPEECH_TOKEN_INDEX = -200
-# DEFAULT_SPEECH_TOKEN = "<speech>"
 
 
 # -----------------------------------------------------------------------------
@@ -159,9 +148,6 @@ def preprocess_llama_3(
     # Mask targets
     sep = "<|start_header_id|>" + conv.roles[1] + "<|end_header_id|>\n\n"
     for conversation, target in zip(conversations, targets): #* ek conversation, ek target
-        total_len = int(target.ne(tokenizer.pad_token_id).sum())  #* count the total number of non-padded tokens in the target
- 
- #! will be used for training the model
         #* ignore the first token in the target, it is the bos token
         cur_len = 1
         target[:cur_len] = IGNORE_INDEX
@@ -179,14 +165,6 @@ def preprocess_llama_3(
         cur_len += conversation_len
         target[cur_len:] = IGNORE_INDEX #* ignoring the padding
         #! the taget only contains the assistant message without the assistant header
-    
-        # if cur_len < tokenizer.model_max_length:
-        #     if cur_len != total_len:
-        #         target[:] = IGNORE_INDEX
-        #         print(
-        #             f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
-        #             f" (ignored)"
-        #         )
 
     return dict(
         input_ids=input_ids,
@@ -206,16 +184,3 @@ def preprocess(
     """
     return preprocess_llama_3(sources, tokenizer, has_speech=has_speech)
 
-
-if __name__ == "__main__":
-    source = [
-        {"from": "human", "value": "<speech>\nPlease directly answer..."},
-        {"from": "gpt",   "value": "Hello, how are you?"}
-    ]
-    print("1. imports done")
-    tokenizer = transformers.AutoTokenizer.from_pretrained("models/llama", use_fast=True)
-    print("2. tokenizer loaded")
-    result = print(preprocess([source], tokenizer, has_speech=True))
-    print("3. preprocess done")
-    print(result)
-    print("cool it's working 🚀")

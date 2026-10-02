@@ -6,14 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-
-def load_json_array_maybe_prefixed(path: Path):
-    text = path.read_text(encoding="utf-8")
-    start = text.find("[")
-    end = text.rfind("]")
-    if start == -1 or end == -1 or end < start:
-        raise ValueError(f"Could not locate a JSON array in {path}")
-    return json.loads(text[start : end + 1])
+from omni_speech.datasets.json_utils import load_json_array_maybe_prefixed
 
 
 def normalize_entry(item: dict) -> dict | None:
