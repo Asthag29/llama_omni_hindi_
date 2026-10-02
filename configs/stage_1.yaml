@@ -51,10 +51,10 @@ logging:
   wandb_run_id: null
   wandb_run_name: "stage-1-backbone-text"
   checkpoint_monitor: "val_loss"
-  checkpoint_format: "safetensors"
-  save_top_k: 1
+  # Lower is better. During a fit: checkpoints/best -> best-so-far weights (from the
+  # first real validation), checkpoints/last -> latest validation (if save_last).
+  # After a completed fit: best_model/ and final_model/.
   save_last: true
-  save_weights_only: true
 
 hydra:
   run:

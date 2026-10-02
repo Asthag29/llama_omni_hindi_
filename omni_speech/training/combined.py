@@ -19,13 +19,12 @@ from omni_speech.datasets.preprocess import preprocess, preprocess_multimodal
 from omni_speech.train_utils import (
     build_callbacks,
     build_loggers,
+    finalize_fit_outputs,
     load_omni_speech_checkpoint,
     load_audio_16k,
     model_dtype,
     optional_abs_path,
     resolve_checkpoint_path,
-    resolve_training_state_path,
-    save_omni_speech_checkpoint,
 )
 from omni_speech.model.language_model.omni_speech_llama import (
     OmniSpeechConfig,
@@ -701,18 +700,10 @@ def main(cfg: DictConfig):
         enable_checkpointing=False,
     )
 
-    resume_cfg = cfg.get("resume")
-    resume_path = resume_cfg.get("path") if resume_cfg is not None else None
-    ckpt_path = None
-    if resume_path:
-        ckpt_path = resolve_training_state_path(resume_path)
-        print(f"Resuming trainer state from {ckpt_path}")
-
-    trainer.fit(module, datamodule=data_module, ckpt_path=ckpt_path)
-    final_dir = to_absolute_path(os.path.join(cfg.logging.output_dir, "final_model"))
-    save_omni_speech_checkpoint(module, final_dir, metadata={"final": True})
-    if trainer.global_rank == 0:
-        module.tokenizer.save_pretrained(final_dir)
+    trainer.fit(module, datamodule=data_module)
+    finalize_fit_outputs(
+        trainer, module, to_absolute_path(str(cfg.logging.output_dir)), tokenizer=module.tokenizer,
+    )
 
 
 if __name__ == "__main__":

@@ -21,17 +21,21 @@ from omni_speech.constants import DEFAULT_SPEECH_PROMPT
 from omni_speech.datasets.preprocess import tokenizer_speech_token
 from omni_speech.training.combined import OmniSpeechTrainingModule
 from omni_speech.train_utils import (
+    BEST_MODEL_DIRNAME,
+    FINAL_MODEL_DIRNAME,
     is_safetensors_checkpoint,
     load_audio_16k,
     load_omni_speech_checkpoint,
     model_dtype,
     resolve_checkpoint_path,
+    stable_best_checkpoint_path,
 )
 
 AUDIO_PATH = REPO_ROOT / "data" / "inference.wav"
 CONFIG_PATH = REPO_ROOT / "configs" / "stage_2.yaml"
 
-# Leave CHECKPOINT_PATH as None to auto-pick models/hindi, then a stage-2 run under outputs/stage_2.
+# Leave CHECKPOINT_PATH as None to auto-pick models/hindi, then a stage-2 run under outputs/stage_2
+# (see find_stage2_checkpoint for the order).
 CHECKPOINT_PATH = None
 STAGE2_RUN_ID = "speech_text"
 
@@ -44,9 +48,7 @@ TOP_P = None
 NUM_BEAMS = 1
 
 def checkpoint_sort_key(path: Path):
-    if path.name == "final_model":
-        return (0, 0.0, -path.stat().st_mtime)
-
+    """Fallback order for other checkpoint directories: lowest val_loss first."""
     meta_path = path / "checkpoint_meta.json"
     if meta_path.is_file():
         try:
@@ -54,16 +56,21 @@ def checkpoint_sort_key(path: Path):
         except json.JSONDecodeError:
             meta = {}
         if "val_loss" in meta:
-            return (1, float(meta["val_loss"]), -path.stat().st_mtime)
+            return (0, float(meta["val_loss"]), -path.stat().st_mtime)
 
-    return (2, 0.0, -path.stat().st_mtime)
+    return (1, 0.0, -path.stat().st_mtime)
 
 
 def find_stage2_checkpoint(
     checkpoint_path: str | Path | None = CHECKPOINT_PATH,
     run_id: str | None = STAGE2_RUN_ID,
 ) -> Path:
-    """Pick the checkpoint to load: explicit path, then models/hindi, then a stage-2 run."""
+    """Pick the checkpoint to load: explicit path, then models/hindi, then a stage-2 run.
+
+    Within a stage-2 run directory: best_model/, checkpoints/best (best-so-far of a
+    running or killed fit), final_model/, checkpoints/last, then any other
+    checkpoints/* directory with the lowest val_loss.
+    """
     if checkpoint_path is not None:
         return Path(checkpoint_path).expanduser().resolve()
 
@@ -88,10 +95,19 @@ def find_stage2_checkpoint(
             continue
         seen.add(root)
 
-        preferred = [root / "checkpoints" / "last", root / "final_model"]
+        # best_model (completed run), then the best-so-far weights of a running or
+        # killed run, then the last weights.
+        preferred = [
+            root / BEST_MODEL_DIRNAME,
+            Path(stable_best_checkpoint_path(str(root))),
+            root / FINAL_MODEL_DIRNAME,
+            root / "checkpoints" / "last",
+        ]
         for path in preferred:
             if is_safetensors_checkpoint(path):
-                return path
+                # Pin a symlink (checkpoints/best, checkpoints/last) to the directory it
+                # points at now, so a running fit swapping the link cannot change it.
+                return path.resolve() if path.is_symlink() else path
 
         ckpt_root = root / "checkpoints"
         if ckpt_root.is_dir():

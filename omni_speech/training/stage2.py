@@ -46,7 +46,7 @@ from omni_speech.training.combined import OmniSpeechTrainingModule, SpeechCollat
 from omni_speech.train_utils import (
     build_callbacks,
     build_loggers,
-    save_omni_speech_checkpoint,
+    finalize_fit_outputs,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -821,10 +821,9 @@ def main(cfg: DictConfig):
     )
 
     trainer.fit(module, datamodule=data_module)
-    final_dir = to_absolute_path(os.path.join(cfg.logging.output_dir, "final_model"))
-    save_omni_speech_checkpoint(module, final_dir, metadata={"final": True, "streaming": True})
-    if trainer.global_rank == 0:
-        module.tokenizer.save_pretrained(final_dir)
+    finalize_fit_outputs(
+        trainer, module, output_dir, final_metadata={"streaming": True}, tokenizer=module.tokenizer,
+    )
 
 
 if __name__ == "__main__":

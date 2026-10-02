@@ -18,6 +18,7 @@ import csv
 import os
 import shutil
 import logging
+import time
 from typing import Dict, Optional
 
 import numpy as np
@@ -26,7 +27,7 @@ import torch
 import torchaudio
 from hydra.utils import to_absolute_path
 from pytorch_lightning.callbacks import Callback
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 from omegaconf import DictConfig, OmegaConf
 from safetensors.torch import load_file, save_file
@@ -74,12 +75,25 @@ def is_safetensors_checkpoint(path: str) -> bool:
     )
 
 
+def missing_checkpoint_message(path: str) -> str:
+    """Error text for a missing checkpoint, naming a killed run's best-so-far weights."""
+    message = f"Checkpoint not found: {path}"
+    stable_best = stable_best_checkpoint_path(os.path.dirname(os.path.abspath(path)))
+    if is_safetensors_checkpoint(stable_best):
+        message += (
+            f". The run in {os.path.dirname(os.path.abspath(path))} did not finish, but its "
+            f"best-so-far weights exist: pass {stable_best} instead "
+            f"(e.g. model.init_checkpoint={stable_best})."
+        )
+    return message
+
+
 def resolve_checkpoint_path(path: str) -> str:
     path = os.path.abspath(os.path.expanduser(path))
     if os.path.isfile(path) or is_safetensors_checkpoint(path):
         return path
     if not os.path.isdir(path):
-        raise FileNotFoundError(f"Checkpoint not found: {path}")
+        raise FileNotFoundError(missing_checkpoint_message(path))
 
     ranked = []
     legacy = []
@@ -103,37 +117,6 @@ def resolve_checkpoint_path(path: str) -> str:
     raise FileNotFoundError(f"No checkpoints found under: {path}")
 
 
-def resolve_training_state_path(path: str) -> str:
-    path = os.path.abspath(os.path.expanduser(path))
-    if os.path.isfile(path):
-        if not path.endswith(".ckpt"):
-            raise ValueError(f"Resume state must be a Lightning .ckpt file, got: {path}")
-        return path
-    if is_safetensors_checkpoint(path):
-        raise ValueError(
-            f"{path} is a weights-only safetensors checkpoint. "
-            "Full resume requires a Lightning trainer-state .ckpt file."
-        )
-    if not os.path.isdir(path):
-        raise FileNotFoundError(f"Training state checkpoint not found: {path}")
-
-    preferred = [
-        os.path.join(path, "trainer_state", "last.ckpt"),
-        os.path.join(path, "last.ckpt"),
-    ]
-    for candidate in preferred:
-        if os.path.isfile(candidate):
-            return candidate
-
-    discovered = []
-    for root, _, files in os.walk(path):
-        for name in files:
-            if name.endswith(".ckpt"):
-                discovered.append(os.path.join(root, name))
-    if discovered:
-        return max(discovered, key=os.path.getmtime)
-    raise FileNotFoundError(f"No Lightning trainer-state .ckpt file found under: {path}")
-
 def _gather_param(param: torch.Tensor) -> torch.Tensor:
     return param.detach().cpu().clone()
 
@@ -141,9 +124,10 @@ def _gather_param(param: torch.Tensor) -> torch.Tensor:
 def save_omni_speech_checkpoint(module, output_dir: str, metadata: Optional[Dict] = None) -> None:
     from peft import PeftModel
 
-    os.makedirs(output_dir, exist_ok=True)
     model = module.model
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if rank == 0:
+        os.makedirs(output_dir, exist_ok=True)
 
     if isinstance(model, PeftModel):
         if rank == 0:
@@ -195,16 +179,118 @@ def load_omni_speech_checkpoint(module, checkpoint_dir: str, adapter_trainable: 
         module.load_state_dict(load_file(trainable), strict=False)
 
 
-class SafetensorsCheckpointCallback(Callback):
-    def __init__(self, dirpath: str, monitor: str = "val_loss", mode: str = "min",
-                 save_top_k: int = 1, save_last: bool = False):
-        self.dirpath = dirpath
+# --- Best / last weights during a fit, best_model / final_model after it ---
+#
+# Layout of <output_dir> while a fit runs (rank 0 writes; only trainable weights):
+#   checkpoints/step=<N>/          real weight directories, at most two at a time
+#   checkpoints/best -> step=<N>   best-so-far by logging.checkpoint_monitor (lower is
+#                                  better), from the first real validation onwards;
+#                                  a relative symlink swapped atomically (os.replace)
+#   checkpoints/last -> step=<M>   weights of the latest validation (logging.save_last);
+#                                  points at the same directory as `best` when the
+#                                  latest validation was the best one
+# After a completed fit (finalize_fit_outputs):
+#   best_model/    best-by-validation weights (moved out of checkpoints/, not copied)
+#   final_model/   last weights (moved from checkpoints/ when the last validation ran at
+#                  the final step, hard-linked when that was also the best, else written)
+# and checkpoints/ is removed.
+
+CHECKPOINTS_DIRNAME = "checkpoints"
+BEST_LINK_NAME = "best"
+LAST_LINK_NAME = "last"
+BEST_MODEL_DIRNAME = "best_model"
+FINAL_MODEL_DIRNAME = "final_model"
+CHECKPOINT_META_FILENAME = "checkpoint_meta.json"
+_INCOMPLETE_PREFIX = ".incomplete-"
+
+
+def stable_best_checkpoint_path(output_dir: str) -> str:
+    """The best-so-far weights of a (possibly still running or killed) fit."""
+    return os.path.join(output_dir, CHECKPOINTS_DIRNAME, BEST_LINK_NAME)
+
+
+def save_trainable_weights(module, output_dir: str, metadata: Optional[Dict] = None) -> None:
+    """Write the module's trainable weights (and checkpoint_meta.json) into ``output_dir``.
+
+    A module may define ``save_trainable_weights(output_dir, metadata)`` to override
+    how its weights are written; otherwise ``save_omni_speech_checkpoint`` is used.
+    """
+    hook = getattr(module, "save_trainable_weights", None)
+    if callable(hook):
+        hook(output_dir, metadata)
+    else:
+        save_omni_speech_checkpoint(module, output_dir, metadata=metadata)
+
+
+def _write_json_atomic(path: str, data: Dict) -> None:
+    # Write a new inode and rename it over the old one, so a hard-linked sibling
+    # directory never sees the change.
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def _point_symlink(link_path: str, target_name: str) -> None:
+    """Atomically make ``link_path`` a relative symlink to ``target_name``."""
+    tmp_path = link_path + ".tmp"
+    if os.path.lexists(tmp_path):
+        os.remove(tmp_path)
+    os.symlink(target_name, tmp_path)
+    os.replace(tmp_path, link_path)
+
+
+def _remove_path(path: str) -> None:
+    if os.path.islink(path) or os.path.isfile(path):
+        os.remove(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def _link_or_copy_tree(src: str, dst: str, skip=()) -> None:
+    """Recreate ``src`` at ``dst`` with hard links (no extra disk); copy if linking fails."""
+    os.makedirs(dst)
+    for name in os.listdir(src):
+        if name in skip:
+            continue
+        src_path = os.path.join(src, name)
+        dst_path = os.path.join(dst, name)
+        if os.path.isdir(src_path):
+            _link_or_copy_tree(src_path, dst_path, skip)
+            continue
+        try:
+            os.link(src_path, dst_path)
+        except OSError:
+            logging.warning("Hard link %s -> %s failed; copying instead.", src_path, dst_path)
+            shutil.copy2(src_path, dst_path)
+
+
+class BestWeightsCheckpointCallback(Callback):
+    """Keep the best-so-far and the latest weights of a fit on disk (see layout above).
+
+    Only real validations count (sanity checks are ignored). Lower ``monitor`` is
+    better. At most two weight directories exist at any time, including while a new
+    one is being written: the previous ``last`` is deleted before the new weights are
+    written unless it is also the best.
+    """
+
+    def __init__(self, output_dir: str, monitor: str = "val_loss", save_last: bool = True):
+        self.output_dir = output_dir
+        self.dirpath = os.path.join(output_dir, CHECKPOINTS_DIRNAME)
         self.monitor = monitor
-        self.mode = mode
-        self.save_top_k = int(save_top_k)
         self.save_last = bool(save_last)
-        self.best_models: Dict[str, float] = {}
-        os.makedirs(self.dirpath, exist_ok=True)
+        self.best: Optional[Dict] = None  # {"name", "epoch", "global_step", monitor}
+        self.last: Optional[Dict] = None
+
+    @property
+    def best_path(self) -> str:
+        return os.path.join(self.dirpath, BEST_LINK_NAME)
+
+    @property
+    def last_path(self) -> str:
+        return os.path.join(self.dirpath, LAST_LINK_NAME)
 
     def _metric(self, trainer) -> Optional[float]:
         if self.monitor not in trainer.callback_metrics:
@@ -212,81 +298,178 @@ class SafetensorsCheckpointCallback(Callback):
         value = trainer.callback_metrics[self.monitor]
         return float(value.detach().cpu()) if isinstance(value, torch.Tensor) else float(value)
 
-    def _on_epoch_end(self, trainer, pl_module) -> None:
-        if getattr(trainer, "sanity_checking", False):
-            return
-
-        metric = self._metric(trainer)
-        if metric is None:
-            return
-
-        tag = f"epoch={trainer.current_epoch}-step={trainer.global_step}-{self.monitor}={metric:.4f}"
-        ckpt_dir = os.path.join(self.dirpath, tag)
-
-        # Rank 0 writes the files; save_omni_speech_checkpoint coordinates the rest.
-        save_omni_speech_checkpoint(
-            pl_module, ckpt_dir,
-            metadata={"epoch": int(trainer.current_epoch), "global_step": int(trainer.global_step), self.monitor: metric},
-        )
-
+    def on_fit_start(self, trainer, pl_module) -> None:
+        self.best = None
+        self.last = None
         if trainer.global_rank != 0:
             return
-
-        if not os.path.isdir(ckpt_dir):
-            logging.warning("Skipping checkpoint bookkeeping because %s was not created.", ckpt_dir)
-            return
-
-        if self.save_last:
-            last_dir = os.path.join(self.dirpath, "last")
-            if os.path.isdir(last_dir):
-                shutil.rmtree(last_dir)
-            shutil.copytree(ckpt_dir, last_dir)
-
-        self.best_models[ckpt_dir] = metric
-        if self.save_top_k > 0:
-            ranked = sorted(self.best_models.items(), key=lambda x: x[1], reverse=self.mode != "min")
-            for stale_dir, _ in ranked[self.save_top_k:]:
-                self.best_models.pop(stale_dir, None)
-                if os.path.isdir(stale_dir):
-                    shutil.rmtree(stale_dir)
-
-    def on_validation_epoch_end(self, trainer, pl_module) -> None:
-        self._on_epoch_end(trainer, pl_module)
-
-    def on_train_epoch_end(self, trainer, pl_module) -> None:
-        if getattr(trainer, "num_val_dataloaders", 0) > 0:
-            return
-        self._on_epoch_end(trainer, pl_module)
-
-
-class ResumeStateCheckpointCallback(Callback):
-    """Persist one rolling Lightning checkpoint with optimizer/scheduler state."""
-
-    def __init__(self, dirpath: str, filename: str = "last.ckpt"):
-        self.dirpath = dirpath
-        self.filename = filename
+        if os.path.isdir(self.dirpath) and os.listdir(self.dirpath):
+            aside = f"{self.dirpath}_previous_run_{time.strftime('%Y%m%d-%H%M%S')}"
+            os.rename(self.dirpath, aside)
+            print(
+                f"WARNING: {self.dirpath} was not empty (an earlier run's weights); moved it "
+                f"to {aside}. Delete it when no longer needed: it uses disk quota.",
+                flush=True,
+            )
         os.makedirs(self.dirpath, exist_ok=True)
 
-    @property
-    def path(self) -> str:
-        return os.path.join(self.dirpath, self.filename)
-
-    def _save(self, trainer) -> None:
-        trainer.save_checkpoint(self.path, weights_only=False)
-
-    def on_validation_epoch_end(self, trainer, pl_module) -> None:
-        self._save(trainer)
+    def on_validation_end(self, trainer, pl_module) -> None:
+        if trainer.sanity_checking or trainer.state.fn != "fit":
+            return
+        metric = self._metric(trainer)
+        if metric is None:
+            logging.warning("%s was not logged during validation; no checkpoint written.", self.monitor)
+            return
+        improved = self.best is None or metric < self.best[self.monitor]
+        if improved or self.save_last:
+            self._save(trainer, pl_module, metric, improved)
 
     def on_train_epoch_end(self, trainer, pl_module) -> None:
-        if getattr(trainer, "num_val_dataloaders", 0) > 0:
+        # Without validation there is no "best"; keep the latest weights only.
+        if trainer.enable_validation or not self.save_last:
             return
-        self._save(trainer)
+        self._save(trainer, pl_module, None, improved=False)
 
-    def on_exception(self, trainer, pl_module, exception) -> None:
-        self._save(trainer)
+    def _new_name(self, step: int) -> str:
+        taken = {record["name"] for record in (self.best, self.last) if record is not None}
+        name, suffix = f"step={step}", 1
+        while name in taken:
+            suffix += 1
+            name = f"step={step}-{suffix}"
+        return name
 
-    def on_train_end(self, trainer, pl_module) -> None:
-        self._save(trainer)
+    def _save(self, trainer, pl_module, metric: Optional[float], improved: bool) -> None:
+        step, epoch = int(trainer.global_step), int(trainer.current_epoch)
+        name = self._new_name(step)
+        record = {"name": name, "epoch": epoch, "global_step": step, self.monitor: metric}
+        rank0 = trainer.global_rank == 0
+        stale_last = self.last is not None and (self.best is None or self.last["name"] != self.best["name"])
+        tmp_dir = os.path.join(self.dirpath, _INCOMPLETE_PREFIX + name)
+
+        if rank0:
+            # Free the previous `last` before writing, so at most two copies ever exist.
+            if stale_last:
+                _remove_path(self.last_path)
+                _remove_path(os.path.join(self.dirpath, self.last["name"]))
+            _remove_path(tmp_dir)
+
+        metadata = {"epoch": epoch, "global_step": step}
+        if metric is not None:
+            metadata[self.monitor] = metric
+        save_trainable_weights(pl_module, tmp_dir, metadata=metadata)
+
+        if rank0:
+            if not os.path.isdir(tmp_dir):
+                raise RuntimeError(f"Saving trainable weights did not create {tmp_dir}.")
+            os.rename(tmp_dir, os.path.join(self.dirpath, name))
+            if improved:
+                _point_symlink(self.best_path, name)
+            if self.save_last:
+                _point_symlink(self.last_path, name)
+            if improved and self.best is not None:
+                _remove_path(os.path.join(self.dirpath, self.best["name"]))  # superseded best
+            if improved:
+                print(
+                    f"New best weights: {self.monitor}={metric:.4f} at step {step} -> {self.best_path}",
+                    flush=True,
+                )
+
+        if improved:
+            self.best = record
+        self.last = record if self.save_last else None
+
+
+def find_best_weights_callback(trainer) -> Optional[BestWeightsCheckpointCallback]:
+    for callback in trainer.callbacks:
+        if isinstance(callback, BestWeightsCheckpointCallback):
+            return callback
+    return None
+
+
+def _fmt_metric(value) -> str:
+    return "not validated at this step" if value is None else f"{value:.4f}"
+
+
+def finalize_fit_outputs(trainer, module, output_dir: str, final_metadata: Optional[Dict] = None,
+                         tokenizer=None) -> Dict:
+    """After a completed ``trainer.fit``: write ``best_model/`` and ``final_model/``.
+
+    ``best_model`` is moved out of ``checkpoints/`` (no copy). ``final_model`` is the
+    latest ``checkpoints/`` entry if it was taken at the final step (moved, or
+    hard-linked when it is also the best), otherwise freshly written. If no validation
+    ran, ``best_model`` is a hard-linked twin of ``final_model``. Previous
+    ``best_model``/``final_model`` directories are replaced and ``checkpoints/`` is
+    removed. Prints one summary line and returns the summary.
+    """
+    output_dir = os.path.abspath(output_dir)
+    callback = find_best_weights_callback(trainer)
+    monitor = callback.monitor if callback is not None else "val_loss"
+    best = callback.best if callback is not None else None
+    last = callback.last if callback is not None else None
+    ckpt_dir = callback.dirpath if callback is not None else os.path.join(output_dir, CHECKPOINTS_DIRNAME)
+    best_dir = os.path.join(output_dir, BEST_MODEL_DIRNAME)
+    final_dir = os.path.join(output_dir, FINAL_MODEL_DIRNAME)
+    rank0 = trainer.global_rank == 0
+
+    step = int(trainer.global_step)
+    # A checkpoints/ entry taken at the final step already holds the final weights.
+    reuse = next((r for r in (last, best) if r is not None and r["global_step"] == step), None)
+    final_record = dict(reuse) if reuse is not None else {
+        "epoch": int(trainer.current_epoch), "global_step": step, monitor: None,
+    }
+    final_record.pop("name", None)
+
+    if rank0:
+        _remove_path(best_dir)
+        _remove_path(final_dir)
+        if last is not None and last is not reuse and (best is None or last["name"] != best["name"]):
+            _remove_path(os.path.join(ckpt_dir, last["name"]))  # stale; frees disk first
+        if best is not None:
+            os.rename(os.path.join(ckpt_dir, best["name"]), best_dir)  # move, not copy
+        if reuse is not None:
+            if best is not None and reuse["name"] == best["name"]:
+                _link_or_copy_tree(best_dir, final_dir, skip=(CHECKPOINT_META_FILENAME,))
+            else:
+                os.rename(os.path.join(ckpt_dir, reuse["name"]), final_dir)
+
+    final_meta = {**final_record, "final": True, **(final_metadata or {})}
+    if reuse is None:
+        save_trainable_weights(module, final_dir, metadata=final_meta)
+
+    if rank0:
+        _write_json_atomic(os.path.join(final_dir, CHECKPOINT_META_FILENAME), final_meta)
+        if best is None:
+            _link_or_copy_tree(final_dir, best_dir, skip=(CHECKPOINT_META_FILENAME,))
+            best_meta = {**final_record, "best": True, "no_validation": True}
+        else:
+            best_meta = {k: v for k, v in best.items() if k != "name"}
+            best_meta["best"] = True
+        _write_json_atomic(os.path.join(best_dir, CHECKPOINT_META_FILENAME), best_meta)
+
+        for link in (BEST_LINK_NAME, LAST_LINK_NAME):
+            if os.path.islink(os.path.join(ckpt_dir, link)):
+                os.remove(os.path.join(ckpt_dir, link))
+        if os.path.isdir(ckpt_dir) and not os.listdir(ckpt_dir):
+            os.rmdir(ckpt_dir)
+
+        if tokenizer is not None:
+            tokenizer.save_pretrained(best_dir)
+            tokenizer.save_pretrained(final_dir)
+
+    if best is None:
+        summary_line = (
+            f"No validation ran: best_model = final weights (step {step}). "
+            f"best_model: {best_dir}; final_model: {final_dir}"
+        )
+    else:
+        summary_line = (
+            f"Best weights: step {best['global_step']} (epoch {best['epoch']}), "
+            f"{monitor}={_fmt_metric(best[monitor])} -> {best_dir}; "
+            f"final weights: step {step}, {monitor}={_fmt_metric(final_record.get(monitor))} -> {final_dir}"
+        )
+    if rank0:
+        print(summary_line, flush=True)
+    return {"best": best_meta if rank0 else None, "final": final_meta, "line": summary_line}
 
 
 def build_loggers(cfg: DictConfig):
@@ -312,31 +495,21 @@ def build_loggers(cfg: DictConfig):
 
 
 def build_callbacks(cfg: DictConfig, has_validation: bool):
-    output_dir = to_absolute_path(str(cfg.logging.output_dir))
-    monitor = cfg.logging.checkpoint_monitor
-    if not has_validation and str(monitor).startswith("val_"):
-        monitor = "train_loss_epoch"
+    """Checkpoint (best/last weights), LR monitor and local metrics-table callbacks.
 
-    checkpoint_dir = os.path.join(output_dir, "checkpoints")
-    checkpoint_format = str(cfg.logging.get("checkpoint_format", "safetensors")).lower()
-    if checkpoint_format == "lightning":
-        checkpoint_callback = ModelCheckpoint(
-            dirpath=checkpoint_dir,
-            filename="epoch={epoch}-step={step}-loss={%s:.4f}" % monitor,
-            monitor=monitor,
-            mode="min",
-            save_top_k=cfg.logging.save_top_k,
-            save_last=cfg.logging.save_last,
-            save_weights_only=bool(cfg.logging.get("save_weights_only", False)),
+    Reads ``logging.checkpoint_monitor`` (lower is better) and ``logging.save_last``.
+    """
+    output_dir = to_absolute_path(str(cfg.logging.output_dir))
+    if not has_validation:
+        logging.warning(
+            "No validation data: no best-by-validation weights are tracked; "
+            "best_model will equal the final weights."
         )
-    else:
-        checkpoint_callback = SafetensorsCheckpointCallback(
-            dirpath=checkpoint_dir,
-            monitor=monitor,
-            mode="min",
-            save_top_k=cfg.logging.save_top_k,
-            save_last=cfg.logging.save_last,
-        )
+    checkpoint_callback = BestWeightsCheckpointCallback(
+        output_dir=output_dir,
+        monitor=str(cfg.logging.checkpoint_monitor),
+        save_last=bool(cfg.logging.get("save_last", True)),
+    )
 
     log_path = os.path.join(
         output_dir,
@@ -357,12 +530,6 @@ def build_callbacks(cfg: DictConfig, has_validation: bool):
             every_n_steps=int(cfg.logging.get("local_log_every_n_steps", 500)),
         ),
     ]
-    if bool(cfg.logging.get("save_resume_state", False)):
-        resume_dir = os.path.join(
-            output_dir,
-            str(cfg.logging.get("resume_state_dir", "trainer_state")),
-        )
-        callbacks.append(ResumeStateCheckpointCallback(dirpath=resume_dir))
     return callbacks
 
 
@@ -454,20 +621,6 @@ class LocalMetricsLogCallback(Callback):
             f.flush()
             os.fsync(f.fileno())
 
-    def _load_existing_csv_rows(self) -> bool:
-        """On resume, keep the rows of the interrupted run if the CSV has our header."""
-        if not self.csv_path or not os.path.isfile(self.csv_path):
-            return False
-        with open(self.csv_path, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            if tuple(reader.fieldnames or ()) != self.HEADERS:
-                return False
-            self.rows = [
-                {key: (None if value == "" else value) for key, value in row.items()}
-                for row in reader
-            ]
-        return True
-
     def _write_log_table(self) -> None:
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
         table_rows = [
@@ -518,13 +671,11 @@ class LocalMetricsLogCallback(Callback):
         self._row_due = False
         if trainer.global_rank != 0:
             return
-        resumed = bool(trainer.ckpt_path) and self._load_existing_csv_rows()
-        if self.csv_path and not resumed:
+        if self.csv_path:
             self._write_csv_header()
         self._write_log_table()
 
     def on_train_start(self, trainer, pl_module) -> None:
-        # Runs after a resume checkpoint has restored global_step.
         self._last_step = trainer.global_step
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:

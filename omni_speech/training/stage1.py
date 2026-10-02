@@ -27,9 +27,9 @@ from omni_speech.model.language_model.omni_speech_llama import (
 from omni_speech.train_utils import (
     build_callbacks,
     build_loggers,
+    finalize_fit_outputs,
     model_dtype,
     optional_abs_path,
-    save_omni_speech_checkpoint,
 )
 
 
@@ -656,10 +656,9 @@ def main(cfg: DictConfig):
     )
 
     trainer.fit(module, datamodule=data_module)
-    final_dir = to_absolute_path(os.path.join(cfg.logging.output_dir, "final_model"))
-    save_omni_speech_checkpoint(module, final_dir, metadata={"final": True})
-    if trainer.global_rank == 0:
-        module.tokenizer.save_pretrained(final_dir)
+    finalize_fit_outputs(
+        trainer, module, to_absolute_path(str(cfg.logging.output_dir)), tokenizer=module.tokenizer,
+    )
 
 
 if __name__ == "__main__":
