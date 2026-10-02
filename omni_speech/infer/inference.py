@@ -150,16 +150,32 @@ def load_module_from_checkpoint(
         if unexpected:
             print(f"Unexpected keys: {len(unexpected)}")
 
+    # Training keeps the trainable LoRA/projector weights in fp32 while the base is
+    # half precision; generation runs without autocast, so cast everything to one
+    # inference dtype (bf16 on GPU by default, fp32 for the CPU "32-true" config).
+    # Only parameters are cast; buffers such as the rotary inv_freq keep their dtype.
+    inference_dtype = model_dtype(cfg.training.precision)
+    for param in module.parameters():
+        if param.is_floating_point():
+            param.data = param.data.to(inference_dtype)
     module.eval().to(device)
     module.model.config.use_cache = True
     return module, device
+
+
+def speech_input_dtype(model) -> torch.dtype:
+    """Dtype the speech features must have: the dtype of the loaded model's weights."""
+    for param in model.parameters():
+        if param.is_floating_point():
+            return param.dtype
+    return torch.float32
 
 
 def prepare_speech(audio_path: Path, cfg, module, device: torch.device):
     audio = load_audio_16k(audio_path)
     input_type = str(cfg.data.input_type)
     mel_size = int(cfg.data.mel_size)
-    dtype = model_dtype(cfg.training.precision) if device.type == "cuda" else torch.float32
+    dtype = speech_input_dtype(module.model)
 
     if input_type == "raw":
         speech = torch.from_numpy(audio)

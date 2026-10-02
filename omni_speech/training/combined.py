@@ -31,6 +31,7 @@ from omni_speech.model.language_model.omni_speech_llama import (
     OmniSpeechConfig,
     OmniSpeechLlamaForCausalLM,
 )
+from omni_speech.training.stage1 import promote_trainable_params_to_fp32
 
 class SpeechDataset(Dataset):
     """Dataset for speech conversation samples; batching is handled by the collator."""
@@ -382,10 +383,12 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         self.tokenizer, self.model = self._load_model_and_tokenizer()
         self.speech_dtype = model_dtype(cfg.training.precision)
         self._maybe_apply_lora()
-        self._maybe_load_init_checkpoint()
         self._configure_trainable_parameters()
         self._maybe_enable_gradient_checkpointing()
+        # Promote before loading the init checkpoint so fp32 weights are copied
+        # into fp32 parameters instead of being rounded through bf16.
         self._promote_trainable_params_to_fp32()
+        self._maybe_load_init_checkpoint()
         self._accumulated_microbatch_losses = []
 
     def _get_inner_speech_model(self): #! need to check this for training with print statements
@@ -517,15 +520,7 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         print("Gradient checkpointing enabled.")
 
     def _promote_trainable_params_to_fp32(self):
-        # Only needed for small trainable subsets under fp16 AMP.
-        # Full LLM fine-tuning must stay in bf16/fp16 or it OOMs immediately.
-        tune_llm = bool(self.cfg.training.get("tune_llm_backbone", False))
-        precision = str(self.cfg.training.precision)
-        if tune_llm or "bf16" in precision:
-            return
-        for param in self.parameters():
-            if param.requires_grad:
-                param.data = param.data.float()
+        promote_trainable_params_to_fp32(self, self.cfg.training)
 
     def _keep_speech_encoder_eval(self):
         if bool(self.cfg.training.get("tune_speech_encoder", False)):

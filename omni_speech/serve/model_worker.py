@@ -22,7 +22,11 @@ from omni_speech.constants import WORKER_HEART_BEAT_INTERVAL
 from omni_speech.serve.utils import (build_logger, server_error_msg,
     pretty_print_semaphore)
 from omni_speech.datasets.preprocess import tokenizer_speech_token
-from omni_speech.infer.inference import load_inference_cfg, load_module_from_checkpoint
+from omni_speech.infer.inference import (
+    load_inference_cfg,
+    load_module_from_checkpoint,
+    speech_input_dtype,
+)
 from transformers import TextIteratorStreamer
 from threading import Thread
 
@@ -137,7 +141,7 @@ class ModelWorker:
         if audio is not None and len(audio) > 0:
             speech = load_speech(audio, self.input_type, self.mel_size, self.model.config.speech_normalize)
             speech_length = torch.LongTensor([speech.shape[0]]).unsqueeze(0).to(self.device)
-            speech_dtype = torch.float16 if self.device.startswith("cuda") else torch.float32
+            speech_dtype = speech_input_dtype(model)
             speech_tensor = speech.unsqueeze(0).to(self.device, dtype=speech_dtype)
             speech_args = {"speech": speech_tensor, "speech_lengths": speech_length}
         else:

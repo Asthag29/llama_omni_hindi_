@@ -301,6 +301,33 @@ class TextDataModule(pl.LightningDataModule):
         return self._eval_dataloader(self.test_dataset)
 
 
+def promote_trainable_params_to_fp32(module, training_cfg) -> None:
+    """Keep the trainable subset (LoRA adapter / speech projector) in fp32.
+
+    The optimizer is built from these parameters, so AdamW's moments are fp32 too;
+    bf16 master weights round small updates away and freeze Adam's second moment.
+    The frozen base keeps the dtype it was loaded in. Call after LoRA is attached
+    and requires_grad is configured, and before any checkpoint is loaded into the
+    trainable parameters or the optimizer is built.
+    """
+    tune_llm = bool(training_cfg.get("tune_llm_backbone", False))
+    use_lora = bool(training_cfg.get("use_lora", False)) and tune_llm
+    # Full LLM fine-tuning (no LoRA) must stay in bf16/fp16 or it OOMs immediately:
+    # fp32 weights, grads and Adam moments for ~8B parameters do not fit.
+    full_finetune = tune_llm and not use_lora
+    trainable = [p for p in module.parameters() if p.requires_grad]
+    if not full_finetune:
+        for param in trainable:
+            if param.is_floating_point():
+                param.data = param.data.float()
+    trainable_dtypes = sorted({str(p.dtype) for p in trainable})
+    frozen_dtypes = sorted({str(p.dtype) for p in module.parameters() if not p.requires_grad})
+    print(
+        f"Trainable params: {sum(p.numel() for p in trainable):,} in {trainable_dtypes}; "
+        f"frozen base in {frozen_dtypes}"
+    )
+
+
 class BackboneTrainingModule(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -430,13 +457,7 @@ class BackboneTrainingModule(pl.LightningModule):
         print("Gradient checkpointing enabled.")
 
     def _promote_trainable_params_to_fp32(self):
-        tune_llm = bool(self.cfg.training.get("tune_llm_backbone", False))
-        precision = str(self.cfg.training.precision)
-        if tune_llm or "bf16" in precision:
-            return
-        for param in self.parameters():
-            if param.requires_grad:
-                param.data = param.data.float()
+        promote_trainable_params_to_fp32(self, self.cfg.training)
 
     def forward(self, batch):
         return self.model(
