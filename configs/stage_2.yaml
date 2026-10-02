@@ -2,9 +2,10 @@ data:
   seed: 42
   input_type: "mel"
   mel_size: 128
-  # Each streaming worker reads the HF stream and skips rows assigned to other
-  # workers, so more workers mean more duplicated stream reads. Lower to 0 if
-  # stream I/O becomes the bottleneck.
+  # DataLoader workers per GPU. `datasets` gives each worker a disjoint set of
+  # parquet files, so every row is read and yielded exactly once per pass
+  # (stage2.py no longer filters rows by index). Workers beyond the number of
+  # files stay idle; nothing is lost or duplicated.
   num_workers: 2
   prefetch_factor: 2
   persistent_workers: true
@@ -44,13 +45,28 @@ training:
   attn_implementation: "sdpa"
 
 streaming:
+  # Local mode (default): read <data_dir>/{train,validation,test}/*.parquet,
+  # filtered to clips <= 30 s and split with the stage-1 ids. Row counts for
+  # the LR schedule come from <data_dir>/manifest.json. Relative paths are
+  # resolved from the repository root. Build the directory with:
+  #   python -m omni_speech.datasets.processing.build_stage2_local
+  # Set to null to stream from the Hub instead (keys marked "Hub mode only").
+  data_dir: "data/speech"
+  # Rows held in each worker's shuffle buffer (raw parquet rows, audio still
+  # FLAC-compressed): ~0.2 MB/row on average, ~0.5 MB max, so 1024 rows is
+  # ~200 MB per worker on average and at most ~512 MB per worker.
+  shuffle_buffer_size: 1024
+  cache_dir: null
+  # --- Hub mode only (used when data_dir is null) ---
   repo_id: "Pastaaaaa2003/hindi-llama-omni"
   repo_type: "dataset"
   parquet_prefix: "data"
-  cache_dir: null
+  # Hub mode only: rows per training pass, used for the LR schedule.
   train_samples: 105000
+  # Hub mode only: informational (recorded in streaming_run.json); the whole
+  # validation split is always evaluated.
   validation_samples: 5720
-  shuffle_buffer_size: 64
+  # Hub mode only.
   train_parquet_patterns:
     - "data/batch_0000[0-9][0-9]-*.parquet"
     - "data/batch_0001[0-9][0-9]-*.parquet"
@@ -65,6 +81,7 @@ streaming:
     - "data/batch_000208-*.parquet"
     - "data/batch_000209-*.parquet"
     - "data/batch_000210-*.parquet"
+  # Hub mode only.
   validation_parquet_patterns:
     - "data/batch_000211-*.parquet"
     - "data/batch_000212-*.parquet"
