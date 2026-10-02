@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from unittest import mock
 import pytorch_lightning as pl
 import torch
 import yaml
+from pytorch_lightning.callbacks import LearningRateMonitor
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -112,20 +114,24 @@ class KillAfterValidations(pl.Callback):
                 raise RuntimeError("simulated scheduler kill")
 
 
-def make_cfg(output_dir):
+def make_cfg(output_dir, **logging_overrides):
     return OmegaConf.create({"logging": {
         "output_dir": str(output_dir),
         "log_file": "logs/train.log",
         "csv": False,
         "checkpoint_monitor": "val_loss",
         "save_last": True,
+        **logging_overrides,
     }})
 
 
 def run(output_dir, n_batches=10, val_check_interval=2, max_steps=-1, with_val=True,
-        extra_callbacks=(), val_losses=VAL_LOSSES):
+        extra_callbacks=(), val_losses=VAL_LOSSES, cfg=None, logger=None):
     """Mimics the training mains: build_callbacks + trainer.fit + finalize_fit_outputs."""
     torch.manual_seed(0)
+    cfg = make_cfg(output_dir) if cfg is None else cfg
+    if logger is None:
+        logger = pl.loggers.CSVLogger(str(output_dir), name="pl_logs")
     module = ScriptedValModule(val_losses, output_dir)
     x = torch.randn(n_batches, 4)
     train_loader = DataLoader(TensorDataset(x, x.sum(dim=1, keepdim=True)), batch_size=1)
@@ -137,8 +143,8 @@ def run(output_dir, n_batches=10, val_check_interval=2, max_steps=-1, with_val=T
         devices=1,
         max_epochs=1,
         max_steps=max_steps,
-        logger=pl.loggers.CSVLogger(str(output_dir), name="pl_logs"),
-        callbacks=train_utils.build_callbacks(make_cfg(output_dir), has_validation=with_val)
+        logger=logger,
+        callbacks=train_utils.build_callbacks(cfg, has_validation=with_val)
         + [observer, *extra_callbacks],
         val_check_interval=val_check_interval if with_val else None,
         num_sanity_val_steps=2,
@@ -240,6 +246,100 @@ class BestCheckpointDuringFitTests(unittest.TestCase):
             aside = [p for p in out.iterdir() if p.name.startswith("checkpoints_previous_run_")]
             self.assertEqual(len(aside), 1)
             self.assertTrue((aside[0] / "from_an_earlier_run.txt").is_file())
+
+
+class NonFiniteValidationTests(unittest.TestCase):
+    """A NaN val_loss never becomes (or stays) the best once a finite value exists."""
+
+    def test_nan_first_and_between(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            nan = float("nan")
+            with self.assertLogs(level="WARNING") as logs:
+                module, observer, printed = run(out, n_batches=8, val_losses=[nan, 0.9, nan, 0.8])
+            self.assertEqual(len(observer.snapshots), 4)
+            # Best after each validation: NaN placeholder, then 0.9, still 0.9, then 0.8.
+            self.assertEqual([s["best_marker"]["val_index"] for s in observer.snapshots], [0, 1, 1, 3])
+            self.assertTrue(math.isnan(observer.snapshots[0]["best_meta"]["val_loss"]))
+            self.assertAlmostEqual(observer.snapshots[1]["best_meta"]["val_loss"], 0.9, places=6)
+            self.assertAlmostEqual(observer.snapshots[2]["best_meta"]["val_loss"], 0.9, places=6)
+            self.assertEqual(observer.snapshots[2]["last_marker"]["val_index"], 2)
+            self.assertAlmostEqual(observer.snapshots[3]["best_meta"]["val_loss"], 0.8, places=6)
+            self.assertEqual([s["copies"] for s in observer.snapshots], [1, 1, 2, 1])
+            self.assertLessEqual(max(module.copies_before_each_write), 1)
+            self.assertEqual(sum("not finite" in line for line in logs.output), 2)
+
+            self.assertEqual(read_json(out / "best_model" / "marker.json")["val_index"], 3)
+            self.assertAlmostEqual(read_json(out / "best_model" / "checkpoint_meta.json")["val_loss"], 0.8, places=6)
+            self.assertIn("val_loss=0.8000", printed)
+            self.assertNotIn("WARNING", printed)
+            self.assertFalse((out / "checkpoints").exists())
+
+    def test_nan_after_best_and_at_final_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            nan = float("nan")
+            with self.assertLogs(level="WARNING"):
+                module, observer, printed = run(out, n_batches=6, val_losses=[0.9, nan, nan])
+            self.assertEqual([s["best_marker"]["val_index"] for s in observer.snapshots], [0, 0, 0])
+            self.assertEqual(read_json(out / "best_model" / "marker.json")["val_index"], 0)
+            final_meta = read_json(out / "final_model" / "checkpoint_meta.json")
+            self.assertTrue(math.isnan(final_meta["val_loss"]))
+            self.assertEqual(read_json(out / "final_model" / "marker.json")["val_index"], 2)
+            self.assertIn("val_loss=0.9000", printed)
+            self.assertIn(f"final weights: step {module.trainer.global_step}, val_loss=nan", printed)
+
+    def test_all_validations_nan_keep_first_as_placeholder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            nan = float("nan")
+            with self.assertLogs(level="WARNING"):
+                module, observer, printed = run(out, n_batches=4, val_losses=[nan, nan])
+            self.assertEqual([s["best_marker"]["val_index"] for s in observer.snapshots], [0, 0])
+            self.assertEqual(read_json(out / "best_model" / "marker.json")["val_index"], 0)
+            self.assertTrue(math.isnan(read_json(out / "best_model" / "checkpoint_meta.json")["val_loss"]))
+            self.assertIn("val_loss=nan", printed)
+            self.assertIn("WARNING: every validation val_loss was non-finite", printed)
+
+    def test_inf_does_not_beat_finite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            with self.assertLogs(level="WARNING"):
+                run(out, n_batches=6, val_losses=[float("inf"), 1.5, float("-inf")])
+            self.assertAlmostEqual(read_json(out / "best_model" / "checkpoint_meta.json")["val_loss"], 1.5, places=6)
+
+    def test_resolve_checkpoint_path_ranks_nan_last(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, value in (("a", float("nan")), ("b", 0.9), ("c", None)):
+                (root / name).mkdir()
+                (root / name / "adapter_model.safetensors").touch()
+                (root / name / "checkpoint_meta.json").write_text(json.dumps({"val_loss": value}))
+            self.assertEqual(train_utils.resolve_checkpoint_path(str(root)), str(root / "b"))
+
+
+class NoLoggerTests(unittest.TestCase):
+    def test_fit_with_wandb_and_tensorboard_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            cfg = make_cfg(out, wandb=False, tensorboard=False, csv=True)
+            self.assertEqual(train_utils.build_loggers(cfg), [])
+            callbacks = train_utils.build_callbacks(cfg, has_validation=True)
+            self.assertFalse(any(isinstance(c, LearningRateMonitor) for c in callbacks))
+            module, observer, printed = run(out, cfg=cfg, logger=train_utils.build_loggers(cfg))
+            self.assertIsNone(module.trainer.logger)
+            self.assertIn("Best weights:", printed)
+            rows = (out / "csv" / "metrics.csv").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(rows[0], "epoch,step,train_loss,train_steps_in_window,val_loss,lr")
+            self.assertEqual(len(rows), 1 + len(VAL_LOSSES))
+            self.assertTrue(all(row.split(",")[-1] for row in rows[1:]))  # LR recorded locally
+
+    def test_lr_monitor_kept_when_a_logger_is_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for overrides in ({"tensorboard": True, "wandb": False}, {"tensorboard": False, "wandb": True}):
+                cfg = make_cfg(tmp, **overrides)
+                callbacks = train_utils.build_callbacks(cfg, has_validation=True)
+                self.assertTrue(any(isinstance(c, LearningRateMonitor) for c in callbacks), overrides)
 
 
 class ConfigAndLookupTests(unittest.TestCase):

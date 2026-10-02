@@ -15,6 +15,7 @@
 
 import json
 import csv
+import math
 import os
 import shutil
 import logging
@@ -105,7 +106,10 @@ def resolve_checkpoint_path(path: str) -> str:
             if os.path.isfile(meta_path):
                 with open(meta_path, encoding="utf-8") as f:
                     meta = json.load(f)
-                score = next((float(meta[k]) for k in ("val_loss", "train_loss_epoch") if k in meta), score)
+                score = next((float(meta[k]) for k in ("val_loss", "train_loss_epoch")
+                              if meta.get(k) is not None), score)
+            if not math.isfinite(score):
+                score = float("inf")  # NaN would break the ordering
             ranked.append((score, sub))
         elif name.endswith(".ckpt"):
             legacy.append(sub)
@@ -320,9 +324,32 @@ class BestWeightsCheckpointCallback(Callback):
         if metric is None:
             logging.warning("%s was not logged during validation; no checkpoint written.", self.monitor)
             return
-        improved = self.best is None or metric < self.best[self.monitor]
+        improved = self._is_improvement(metric)
+        if not math.isfinite(metric):
+            if improved:
+                logging.warning(
+                    "%s=%s at step %d is not finite; keeping these weights only as a placeholder "
+                    "best until the first finite %s.",
+                    self.monitor, metric, int(trainer.global_step), self.monitor,
+                )
+            else:
+                logging.warning(
+                    "%s=%s at step %d is not finite; it never counts as an improvement%s.",
+                    self.monitor, metric, int(trainer.global_step),
+                    " (saved as last only)" if self.save_last else "",
+                )
         if improved or self.save_last:
             self._save(trainer, pl_module, metric, improved)
+
+    def _is_improvement(self, metric: float) -> bool:
+        """Lower is better. A non-finite metric only fills an empty best (as a
+        placeholder); any finite metric beats a non-finite best."""
+        if self.best is None:
+            return True
+        if not math.isfinite(metric):
+            return False
+        best = self.best[self.monitor]
+        return best is None or not math.isfinite(best) or metric < best
 
     def on_train_epoch_end(self, trainer, pl_module) -> None:
         # Without validation there is no "best"; keep the latest weights only.
@@ -369,8 +396,9 @@ class BestWeightsCheckpointCallback(Callback):
             if improved and self.best is not None:
                 _remove_path(os.path.join(self.dirpath, self.best["name"]))  # superseded best
             if improved:
+                note = "" if math.isfinite(metric) else " (non-finite placeholder until a finite value)"
                 print(
-                    f"New best weights: {self.monitor}={metric:.4f} at step {step} -> {self.best_path}",
+                    f"New best weights: {self.monitor}={metric:.4f} at step {step} -> {self.best_path}{note}",
                     flush=True,
                 )
 
@@ -467,9 +495,17 @@ def finalize_fit_outputs(trainer, module, output_dir: str, final_metadata: Optio
             f"{monitor}={_fmt_metric(best[monitor])} -> {best_dir}; "
             f"final weights: step {step}, {monitor}={_fmt_metric(final_record.get(monitor))} -> {final_dir}"
         )
+        if best[monitor] is not None and not math.isfinite(best[monitor]):
+            summary_line += f" (WARNING: every validation {monitor} was non-finite)"
+
     if rank0:
         print(summary_line, flush=True)
     return {"best": best_meta if rank0 else None, "final": final_meta, "line": summary_line}
+
+
+def has_any_logger(cfg: DictConfig) -> bool:
+    """Whether ``build_loggers`` creates at least one logger."""
+    return bool(cfg.logging.get("tensorboard", True)) or bool(cfg.logging.get("wandb", False))
 
 
 def build_loggers(cfg: DictConfig):
@@ -503,7 +539,7 @@ CHECKPOINT_MONITOR = "val_loss"
 
 
 def build_callbacks(cfg: DictConfig, has_validation: bool):
-    """Checkpoint (best/last weights by val_loss), LR monitor and local metrics-table callbacks.
+    """Checkpoint (best/last weights by val_loss), LR monitor (if a logger is on) and local metrics-table callbacks.
 
     Reads ``logging.save_last`` and ``logging.csv``.
     """
@@ -521,15 +557,18 @@ def build_callbacks(cfg: DictConfig, has_validation: bool):
 
     log_path = os.path.join(output_dir, LOCAL_LOG_FILE)
     csv_path = os.path.join(output_dir, LOCAL_CSV_FILE) if cfg.logging.get("csv", True) else None
-    callbacks = [
-        checkpoint_callback,
-        LearningRateMonitor(logging_interval="step"),
+    callbacks = [checkpoint_callback]
+    # Lightning refuses a LearningRateMonitor without a logger; with W&B and TensorBoard
+    # both off the local train.log / metrics.csv still record the LR.
+    if has_any_logger(cfg):
+        callbacks.append(LearningRateMonitor(logging_interval="step"))
+    callbacks.append(
         LocalMetricsLogCallback(
             log_path=log_path,
             csv_path=csv_path,
             every_n_steps=int(cfg.logging.get("local_log_every_n_steps", 500)),
-        ),
-    ]
+        )
+    )
     return callbacks
 
 

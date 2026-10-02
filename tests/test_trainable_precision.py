@@ -78,8 +78,9 @@ def build_tiny_model(dtype):
     torch.manual_seed(0)
     with mock.patch.object(omni_speech_arch, "build_speech_encoder", lambda cfg: StubSpeechEncoder()):
         model = OmniSpeechLlamaForCausalLM(tiny_config())
-    # from_pretrained(torch_dtype=...) gives every parameter the configured dtype.
-    return model.to(dtype)
+    # from_pretrained(torch_dtype=...) gives every parameter the configured dtype and
+    # ends with model.eval().
+    return model.to(dtype).eval()
 
 
 class _TinyModelMixin:

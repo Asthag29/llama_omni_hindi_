@@ -28,6 +28,8 @@ from omni_speech.model.language_model.omni_speech_llama import (
 from omni_speech.training.stage1 import (
     check_trainable_params_fp32,
     promote_trainable_params_to_fp32,
+    report_training_modes,
+    set_training_modes,
 )
 
 
@@ -81,6 +83,10 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         self._promote_trainable_params_to_fp32()
         self._maybe_load_init_checkpoint()
         self._accumulated_microbatch_losses = []
+        self._training_modes_reported = False
+        # LLM in train mode (from_pretrained leaves it in eval, which disables gradient
+        # checkpointing); Lightning records and restores this mode around validation.
+        set_training_modes(self)
 
     def _get_inner_speech_model(self): #! need to check this for training with print statements
         model = self.model
@@ -216,6 +222,10 @@ class OmniSpeechTrainingModule(pl.LightningModule):
     def on_fit_start(self):
         # Runs after Lightning's precision plugin has converted the module.
         check_trainable_params_fp32(self, self.cfg.training)
+        self._training_modes_reported = False
+
+    def on_train_start(self):
+        set_training_modes(self)
 
     def _keep_speech_encoder_eval(self):
         if bool(self.cfg.training.get("tune_speech_encoder", False)):
@@ -226,6 +236,7 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         speech_encoder.eval()
 
     def on_train_epoch_start(self):
+        set_training_modes(self)
         self._keep_speech_encoder_eval()
 
     def on_validation_epoch_start(self):
@@ -242,6 +253,9 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
+        if not self._training_modes_reported:
+            report_training_modes(self)
+            self._training_modes_reported = True
         outputs = self(batch)
         loss = outputs.loss
         self._accumulated_microbatch_losses.append(loss.detach())

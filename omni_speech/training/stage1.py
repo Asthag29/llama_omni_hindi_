@@ -357,6 +357,48 @@ def check_trainable_params_fp32(module, training_cfg) -> None:
         )
 
 
+def set_training_modes(module) -> None:
+    """Put the LLM (and its LoRA wrappers) in train mode; keep a frozen speech encoder in eval.
+
+    ``from_pretrained`` returns the model in eval mode, and Lightning never calls
+    ``.train()`` on submodules: it records each submodule's mode before validation
+    and restores exactly that afterwards. ``LlamaModel`` only applies gradient
+    checkpointing when ``self.training`` is True, so without this the configured
+    checkpointing is silently skipped. Call at the end of ``__init__`` (the mode
+    Lightning then records and restores) and again when training starts.
+    The LLM's only dropouts are the LoRA ``lora_dropout`` modules (already in train
+    mode, being new modules) and ``attention_dropout`` (0.0 in the Llama config).
+    """
+    module.model.train()
+    if bool(module.cfg.training.get("tune_speech_encoder", False)):
+        return
+    speech_encoder = module._get_inner_speech_model().get_speech_encoder()
+    if speech_encoder is not None:
+        speech_encoder.eval()
+
+
+def report_training_modes(module) -> None:
+    """Print (once per fit) and check the modes that matter at the first training step."""
+    inner = module._get_inner_speech_model()
+    speech_encoder = inner.get_speech_encoder()
+    llm_training = bool(module.model.training and inner.training)
+    checkpointing = bool(getattr(inner, "gradient_checkpointing", False) and inner.training)
+    encoder_training = None if speech_encoder is None else bool(speech_encoder.training)
+    print(
+        f"LLM training mode: {llm_training}; gradient checkpointing active: {checkpointing}; "
+        f"speech encoder training mode: {encoder_training}",
+        flush=True,
+    )
+    if not llm_training:
+        raise RuntimeError("The language model is in eval mode during a training step.")
+    if bool(module.cfg.training.get("gradient_checkpointing", False)) and not checkpointing:
+        raise RuntimeError(
+            "training.gradient_checkpointing is true but checkpointing is not active in the LLM."
+        )
+    if encoder_training and not bool(module.cfg.training.get("tune_speech_encoder", False)):
+        raise RuntimeError("The frozen speech encoder is in train mode during a training step.")
+
+
 class BackboneTrainingModule(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -368,6 +410,8 @@ class BackboneTrainingModule(pl.LightningModule):
         self._maybe_enable_gradient_checkpointing()
         self._promote_trainable_params_to_fp32()
         self._accumulated_microbatch_losses = []
+        self._training_modes_reported = False
+        set_training_modes(self)
 
     def _get_inner_speech_model(self):
         model = self.model
@@ -488,6 +532,13 @@ class BackboneTrainingModule(pl.LightningModule):
     def on_fit_start(self):
         # Runs after Lightning's precision plugin has converted the module.
         check_trainable_params_fp32(self, self.cfg.training)
+        self._training_modes_reported = False
+
+    def on_train_start(self):
+        set_training_modes(self)
+
+    def on_train_epoch_start(self):
+        set_training_modes(self)
 
     def forward(self, batch):
         return self.model(
@@ -500,6 +551,9 @@ class BackboneTrainingModule(pl.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
+        if not self._training_modes_reported:
+            report_training_modes(self)
+            self._training_modes_reported = True
         outputs = self(batch)
         loss = outputs.loss
         self._accumulated_microbatch_losses.append(loss.detach())
