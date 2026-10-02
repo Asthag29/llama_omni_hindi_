@@ -32,17 +32,17 @@ The runtime flow is:
 omni_speech/
 ├── model/            # LLaMA-Omni architecture: speech encoder, projector, LLM
 ├── tts/              # IndicF5 speech-synthesis wrapper
-├── training/         # stage1.py, stage2.py, combined.py (Hydra + PyTorch Lightning)
-├── datasets/         # text-data downloader, preprocessing, train/validation/test split
+├── training/         # stage1.py, stage2.py, speech_module.py (Hydra + PyTorch Lightning)
+├── datasets/         # text-data downloader, preprocessing, splits, local speech-data builder
 ├── infer/            # inference.py: speech in, Hindi text out
 └── serve/            # controller, model_worker, gradio_web_server
-configs/              # stage_1.yaml, stage_2.yaml, combined.yaml
+configs/              # stage_1.yaml, stage_2.yaml
 evaluations/          # benchmark scripts and results/summary.md
 tests/                # pytest suite
 pyproject.toml        # dependencies (requirements.txt just installs the project)
 check_models.py       # verifies every checkpoint file is present
 data/inference.wav    # IndicF5 reference voice; also the default test question
-data/splits/          # validation and test ids for the stage-1 text data
+data/splits/          # validation and test ids shared by both training stages
 ```
 
 ## 🛠️ Install
@@ -221,13 +221,16 @@ Hindi on text only; stage 2 then adds the speech projector.
 | Output | `outputs/stage_1/backbone_text/` | `outputs/stage_2/speech_text/` |
 
 Shared hyperparameters (all in the YAML configs): LoRA `r=128`, `alpha=64`,
-`dropout=0.05` on all attention and MLP projections; learning rate `1.07e-4`
-with cosine schedule and 5% warmup; batch size 2 × 7 gradient-accumulation
-steps; 3 epochs; gradient checkpointing; gradient clipping at 1.8. With
-`bf16-mixed` the frozen base model and the forward pass are bf16, while the
-trainable LoRA and projector weights and the optimizer state are kept in
-fp32, so small updates are not rounded away. That costs about 3 GB of extra
-GPU memory; peak use is about 26 GB at these settings.
+`dropout=0.05` on all attention and MLP projections; learning rate `1e-4`
+with 5% warmup and cosine decay; batch size 2 × 7 gradient-accumulation
+steps; 3 epochs; gradient checkpointing; gradient clipping at 1.8.
+
+Precision is `bf16-mixed`: the frozen base model and the forward pass are
+bf16, while the trainable LoRA and projector weights and the optimizer state
+are kept in fp32 so that small updates are not rounded away. Training checks
+this at startup and stops if the trainable weights are not fp32, so do not
+use `bf16-true` or `16-true`. Each stage runs on one GPU and peaks at about
+29 GB of GPU memory at the maximum sequence length of 2,048 tokens.
 
 Each run writes to its output directory:
 
@@ -240,15 +243,11 @@ Each run writes to its output directory:
   optimizer steps since the previous row, validation loss, and learning rate,
   written at every validation and every 500 steps in between.
 
-The adapter currently published was trained before these changes, on a single
-H100: stage 1 ran 19,683 optimizer steps in about 11 hours on an earlier
-random 90/10 split, and stage 2 is the checkpoint at step 13,125 of a planned
-22,500, where the job reached its 12-hour limit.
-
 Both stages log to Weights & Biases by default (`logging.wandb: true`,
 project `hindi_llama_omni`). Run `wandb login` first or pass
-`logging.wandb=false`. Any config key can be overridden on the command line
-with Hydra syntax, e.g. `training.devices=2`.
+`logging.wandb=false` to keep only the local logs. Any config key can be
+overridden on the command line with Hydra syntax, for example
+`logging.output_dir=outputs/stage_1/my_run`.
 
 #### Stage 1: Hindi backbone on text
 
@@ -317,25 +316,24 @@ Then train:
 python -m omni_speech.training.stage2
 ```
 
-Stage 2 reads `data/speech/` (`streaming.data_dir`), takes its sample counts
-and learning-rate schedule from `data/speech/manifest.json` (8,523 optimizer
-steps for the data above), and stops with a clear message if the directory has
-not been built. It starts from stage 1's `best_model`
-(`model.init_checkpoint`) and uses the same instruction prompt as inference,
-`DEFAULT_SPEECH_PROMPT` in `omni_speech/constants.py`. Mel features (128 bins)
-are computed on the fly. Setting `streaming.data_dir=null` streams from the
-Hub instead; clips over 30 s are then skipped as they are read.
+Stage 2 reads `data/speech/` (`data.speech_dir`), takes its sample counts and
+learning-rate schedule from `data/speech/manifest.json` (8,523 optimizer steps
+for the data above), and stops with a clear message if the directory has not
+been built. It starts from stage 1's `best_model` (`model.init_checkpoint`;
+pass the path if stage 1 used a different output directory) and uses the same
+instruction prompt as inference, `DEFAULT_SPEECH_PROMPT` in
+`omni_speech/constants.py`. Mel features (128 bins) are computed on the fly,
+and every clip is read exactly once per pass.
 
-Copy `outputs/stage_2/speech_text/best_model/` to `models/hindi/` to serve
-the result.
+The held-out validation and test clips are the same questions that stage 1
+held out, so they are unseen in both stages. As in stage 1, the test split is
+available through `test_dataloader()` and is never used during training.
 
-#### Combined: local FLAC files
+Copy the result to `models/hindi/` to serve it:
 
-`omni_speech.training.combined` (`configs/combined.yaml`) trains the same
-modules as stage 2 from a JSON manifest and individual audio files:
-`data/datasets.json` with `{"speech": "<file>.flac", "conversations": [...]}`
-entries and audio under `data/flac/`. Use it when you have your own
-speech-instruction data on disk.
+```bash
+cp -rL outputs/stage_2/speech_text/best_model models/hindi
+```
 
 ## 📊 Evaluation
 
@@ -358,7 +356,7 @@ model.
 
 The full results discussion is in
 [`evaluations/results/summary.md`](evaluations/results/summary.md). Headline
-numbers (base → fine-tuned, measured with the stage-1 text adapter):
+numbers (base → fine-tuned):
 
 | Benchmark | Metric | Base | Fine-tuned |
 | --- | --- | ---: | ---: |
