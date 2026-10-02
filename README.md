@@ -36,7 +36,7 @@ omni_speech/
 ├── datasets/         # text-data downloader, preprocessing, splits, local speech-data builder
 ├── infer/            # inference.py: speech in, Hindi text out
 └── serve/            # controller, model_worker, gradio_web_server
-configs/              # stage_1.yaml, stage_2.yaml
+configs/              # stage_1.yaml, stage_2.yaml, speech_only.yaml
 evaluations/          # benchmark scripts and results/summary.md
 tests/                # pytest suite
 pyproject.toml        # dependencies (requirements.txt just installs the project)
@@ -334,6 +334,21 @@ Copy the result to `models/hindi/` to serve it:
 ```bash
 cp -rL outputs/stage_2/speech_text/best_model models/hindi
 ```
+
+#### Speech only: a single stage without stage 1
+
+`configs/speech_only.yaml` trains speech in, text out in one stage. It
+inherits every setting from `stage_2.yaml` and only removes the starting
+checkpoint, so the LoRA adapter and the speech projector are trained together
+from the base model:
+
+```bash
+python -m omni_speech.training.stage2 --config-name speech_only
+```
+
+It uses the same clips and the same held-out split as stage 2, so its
+validation loss is directly comparable with the two-stage run, and it writes
+to `outputs/speech_only/speech_text/`.
 
 ## 📊 Evaluation
 
