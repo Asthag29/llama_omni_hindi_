@@ -9,12 +9,17 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset, Sampler, Subset, random_split
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from omni_speech.constants import IGNORE_INDEX
 from omni_speech.datasets.json_utils import load_json_array_maybe_prefixed
 from omni_speech.datasets.preprocess import preprocess
+from omni_speech.datasets.splits import (
+    format_split_table,
+    load_id_list,
+    partition_by_ids,
+)
 from omni_speech.model.language_model.omni_speech_llama import (
     OmniSpeechConfig,
     OmniSpeechLlamaForCausalLM,
@@ -184,6 +189,7 @@ class TextDataModule(pl.LightningDataModule):
         self.tokenizer = tokenizer
         self.train_dataset = None
         self.val_dataset = None
+        self.test_dataset = None
 
     def _fraction_subset(self, dataset, fraction: float, seed_offset: int, name: str):
         if fraction >= 1.0:
@@ -197,47 +203,62 @@ class TextDataModule(pl.LightningDataModule):
         print(f"Using {subset_size}/{len(dataset)} {name} samples ({fraction:.0%}).")
         return Subset(dataset, indices)
 
+    def _split_id_path(self, key: str) -> str:
+        path = optional_abs_path(self.cfg.data.get(key))
+        if path is None:
+            raise ValueError(
+                f"data.{key} is not set in the config. Stage 1 uses the fixed id lists in "
+                "data/splits/; there is no random-split fallback."
+            )
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"data.{key} points to a missing file: {path}")
+        return path
+
     def setup(self, stage=None):
         if self.train_dataset is not None:
             return
+
+        validation_ids = load_id_list(self._split_id_path("validation_ids_path"))
+        test_ids = load_id_list(self._split_id_path("test_ids_path"))
 
         dataset = TextConversationDataset(
             self.cfg.data.json_path,
             self.tokenizer,
         )
 
-        val_split = float(self.cfg.data.validation_split)
-        if len(dataset) < 2 or val_split <= 0:
-            self.train_dataset = self._fraction_subset(
-                dataset,
-                float(self.cfg.data.get("train_fraction", 1.0)),
-                101,
-                "train",
+        indexed = [
+            {"id": sample["id"], "index": index}
+            for index, sample in enumerate(dataset.samples)
+        ]
+        parts = partition_by_ids(indexed, validation_ids, test_ids)
+        print("Stage-1 split (fixed id lists from data.validation_ids_path / data.test_ids_path):")
+        print(
+            format_split_table(
+                {name: [item["id"] for item in items] for name, items in parts.items()}
             )
-            self.val_dataset = None
-            return
-
-        val_size = int(round(len(dataset) * val_split))
-        val_size = max(1, min(len(dataset) - 1, val_size))
-        train_size = len(dataset) - val_size
-        generator = torch.Generator().manual_seed(int(self.cfg.data.seed))
-        train_dataset, val_dataset = random_split(
-            dataset,
-            [train_size, val_size],
-            generator=generator,
         )
+        train_dataset, val_dataset, test_dataset = (
+            Subset(dataset, [item["index"] for item in parts[name]])
+            for name in ("train", "validation", "test")
+        )
+
         self.train_dataset = self._fraction_subset(
             train_dataset,
             float(self.cfg.data.get("train_fraction", 1.0)),
             101,
             "train",
         )
-        self.val_dataset = self._fraction_subset(
-            val_dataset,
-            float(self.cfg.data.get("val_fraction", 1.0)),
-            202,
-            "val",
+        self.val_dataset = (
+            self._fraction_subset(
+                val_dataset,
+                float(self.cfg.data.get("val_fraction", 1.0)),
+                202,
+                "val",
+            )
+            if len(val_dataset) > 0
+            else None
         )
+        self.test_dataset = test_dataset if len(test_dataset) > 0 else None
 
     def train_dataloader(self):
         batch_size = int(self.cfg.training.batch_size)
@@ -260,17 +281,24 @@ class TextDataModule(pl.LightningDataModule):
             pin_memory=torch.cuda.is_available(),
         )
 
-    def val_dataloader(self):
-        if self.val_dataset is None:
+    def _eval_dataloader(self, dataset):
+        if dataset is None:
             return None
         return DataLoader(
-            self.val_dataset,
+            dataset,
             batch_size=self.cfg.training.batch_size,
             shuffle=False,
             num_workers=self.cfg.data.num_workers,
             collate_fn=TextCollator(self.tokenizer),
             pin_memory=torch.cuda.is_available(),
         )
+
+    def val_dataloader(self):
+        return self._eval_dataloader(self.val_dataset)
+
+    def test_dataloader(self):
+        """Held-out test split; only used by ``trainer.test``, never during ``fit``."""
+        return self._eval_dataloader(self.test_dataset)
 
 
 class BackboneTrainingModule(pl.LightningModule):

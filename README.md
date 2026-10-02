@@ -33,7 +33,7 @@ omni_speech/
 ├── model/            # LLaMA-Omni architecture: speech encoder, projector, LLM
 ├── tts/              # IndicF5 speech-synthesis wrapper
 ├── training/         # stage1.py, stage2.py, combined.py (Hydra + PyTorch Lightning)
-├── datasets/         # text-data downloader and preprocessing
+├── datasets/         # text-data downloader, preprocessing, train/validation/test split
 ├── infer/            # inference.py: speech in, Hindi text out
 └── serve/            # controller, model_worker, gradio_web_server
 configs/              # stage_1.yaml, stage_2.yaml, combined.yaml
@@ -42,6 +42,7 @@ tests/                # pytest suite
 pyproject.toml        # dependencies (requirements.txt just installs the project)
 check_models.py       # verifies every checkpoint file is present
 data/inference.wav    # IndicF5 reference voice; also the default test question
+data/splits/          # validation and test ids for the stage-1 text data
 ```
 
 ## 🛠️ Install
@@ -224,7 +225,7 @@ Shared hyperparameters (all in the YAML configs): LoRA `r=128`, `alpha=64`,
 with cosine schedule and 5% warmup; batch size 2 × 7 gradient-accumulation
 steps; 3 epochs; `bf16-mixed`; gradient checkpointing; gradient clipping at
 1.8. The published adapter was trained on a single H100: stage 1 ran its full
-19,683 optimizer steps in about 11 hours; stage 2 is the checkpoint at step
+19,683 optimizer steps in about 11 hours (on an earlier random 90/10 split); stage 2 is the checkpoint at step
 13,125 of a planned 22,500, where the job reached its 12-hour limit.
 
 Both stages log to Weights & Biases by default (`logging.wandb: true`,
@@ -246,11 +247,26 @@ python -m omni_speech.datasets.downloader.hindi_text_downloader   # writes data/
 python -m omni_speech.datasets.processing.format_hindi_instruct   # -> data/instruct/hindi_instruct_conversations.json
 ```
 
+The data is split 80/10/10 into train, validation, and test within each of
+the four sources (seed 42). The held-out ids are tracked in
+`data/splits/validation_ids.txt` and `data/splits/test_ids.txt`; every other
+sample is train. For the 102,055-sample file used here that is 81,643 /
+10,206 / 10,206. Stage 1 prints the split per source at startup and stops if
+the id lists are missing. To regenerate them after changing the data:
+
+```bash
+python -m omni_speech.datasets.processing.split_hindi_instruct          # rewrites data/splits/*.txt
+python -m omni_speech.datasets.processing.split_hindi_instruct --write-json   # also train/validation/test .json files
+```
+
 Then train:
 
 ```bash
 python -m omni_speech.training.stage1
 ```
+
+The test split is never used during training; it is available through the
+data module's `test_dataloader()` for a final `trainer.test` run.
 
 #### Stage 2: speech projector + backbone
 
