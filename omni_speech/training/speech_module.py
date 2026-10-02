@@ -1,27 +1,22 @@
-import copy
-import json
-import os
+"""OmniSpeech speech+text Lightning module (LoRA + speech projector) and its batch collator.
+
+Used by stage-2 training (``omni_speech.training.stage2``), inference
+(``omni_speech.infer.inference``) and serving (``omni_speech.serve.model_worker``).
+"""
+
 from typing import Dict, List
 
-import hydra
 import pytorch_lightning as pl
 import torch
-import whisper
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset, Sampler, Subset, random_split
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from omni_speech.constants import IGNORE_INDEX
-from omni_speech.datasets.preprocess import preprocess, preprocess_multimodal
 from omni_speech.train_utils import (
-    build_callbacks,
-    build_loggers,
-    finalize_fit_outputs,
     load_omni_speech_checkpoint,
-    load_audio_16k,
     model_dtype,
     optional_abs_path,
     resolve_checkpoint_path,
@@ -30,114 +25,10 @@ from omni_speech.model.language_model.omni_speech_llama import (
     OmniSpeechConfig,
     OmniSpeechLlamaForCausalLM,
 )
-from omni_speech.training.stage1 import promote_trainable_params_to_fp32
-
-class SpeechDataset(Dataset):
-    """Dataset for speech conversation samples; batching is handled by the collator."""
-
-    def __init__(
-        self,
-        data_path,
-        tokenizer,
-        model_config,
-        input_type="mel",
-        mel_size=128,
-        audio_root=None,
-    ):
-        self.data_path = optional_abs_path(data_path)
-        self.data_dir = os.path.dirname(self.data_path)
-        self.audio_root = optional_abs_path(audio_root)
-        self.tokenizer = tokenizer
-        self.model_config = model_config
-        self.input_type = input_type
-        self.mel_size = mel_size
-
-        with open(self.data_path, "r") as f:
-            samples = json.load(f)
-
-        # Read the flac directory once — just filenames, not file contents.
-        # This turns 2 filesystem calls per sample into 1 fast hash lookup.
-        root = self.audio_root or self.data_dir
-        self._existing_files = set(os.listdir(root)) if os.path.isdir(root) else set()
-
-        self.samples = self._filter_usable_samples(samples)
-
-        # Simple namespace matching what preprocess_multimodal expects,
-        # fed from the same Hydra config values passed to this class.
-        self.data_args = type("DataArgs", (), {
-            "is_multimodal": True,
-            "input_type": input_type,
-            "mel_size": mel_size,
-        })()
-
-    def __len__(self):
-        return len(self.samples)
-
-    def _has_usable_audio(self, item):
-        speech_path = item.get("speech")
-        if not speech_path:
-            return False
-        filename = os.path.basename(speech_path)
-        return filename in self._existing_files
-
-    def _filter_usable_samples(self, samples): #* if conversation is not in the item, skip it
-        usable = []
-        skipped_missing_audio = 0
-        skipped_no_conversation = 0
-
-        for item in samples:
-            if "conversations" not in item:
-                skipped_no_conversation += 1
-                continue
-            if not self._has_usable_audio(item):
-                skipped_missing_audio += 1
-                continue
-            usable.append(item)
-
-        print(
-            "Loaded "
-            f"{len(usable)} usable speech samples from {self.data_path} "
-            f"(skipped {skipped_missing_audio} missing/empty audio, "
-            f"{skipped_no_conversation} without conversations)."
-        )
-        return usable
-
-    def _resolve_speech_path(self, speech_path):
-        speech_path = os.path.expanduser(speech_path)
-        if os.path.isabs(speech_path):
-            return speech_path
-        root = self.audio_root or self.data_dir
-        return os.path.join(root, speech_path)
-
-    #* volume normalization
-    def _load_speech(self, speech_path):
-        speech = load_audio_16k(self._resolve_speech_path(speech_path))
-        if self.input_type == "raw":
-            speech = torch.from_numpy(speech)
-            if getattr(self.model_config, "speech_normalize", False):
-                speech = torch.nn.functional.layer_norm(speech, speech.shape)
-            return speech, speech.shape[0]
-
-        if self.input_type != "mel":
-            raise ValueError(f"Unsupported input_type: {self.input_type}")
-
-        speech = whisper.pad_or_trim(speech)
-        speech = whisper.log_mel_spectrogram(speech, n_mels=self.mel_size).permute(1, 0)
-        return speech, speech.shape[0]
-
-    def __getitem__(self, index):
-        item = self.samples[index]
-        source = copy.deepcopy(item["conversations"])
-        source = preprocess_multimodal([source], self.data_args)[0]
-        text = preprocess([source], self.tokenizer, has_speech=True)
-        speech, speech_length = self._load_speech(item["speech"])
-
-        return {
-            "input_ids": text["input_ids"].squeeze(0),
-            "labels": text["labels"].squeeze(0),
-            "speech": speech,
-            "speech_length": torch.tensor(speech_length, dtype=torch.long),
-        }
+from omni_speech.training.stage1 import (
+    check_trainable_params_fp32,
+    promote_trainable_params_to_fp32,
+)
 
 
 class SpeechCollator:
@@ -173,205 +64,6 @@ class SpeechCollator:
             "speech_lengths": speech_lengths,
             
         }
-
-
-class LengthBucketSampler(Sampler):
-    """Groups samples of similar text length into batches to minimize padding waste.
-
-    Works with both raw Dataset and Subset (from random_split).
-    Shuffles *between* buckets each epoch so training order varies,
-    but samples *within* a batch have similar lengths.
-    """
-
-    def __init__(self, dataset, batch_size: int, bucket_size_multiplier: int = 10):
-        self.batch_size = batch_size
-        self.dataset = dataset
-
-        lengths = []
-        for i in range(len(dataset)):
-            idx = dataset.indices[i] if hasattr(dataset, "indices") else i
-            base_dataset = dataset.dataset if hasattr(dataset, "dataset") else dataset
-            item = base_dataset.samples[idx]
-            text_len = sum(len(turn.get("value", "")) for turn in item.get("conversations", []))
-            lengths.append((i, text_len))
-
-        lengths.sort(key=lambda x: x[1])
-
-        # Group sorted indices into buckets, then shuffle buckets each epoch.
-        bucket_size = batch_size * bucket_size_multiplier
-        self.buckets = []
-        for start in range(0, len(lengths), bucket_size):
-            bucket = [idx for idx, _ in lengths[start : start + bucket_size]]
-            self.buckets.append(bucket)
-
-    def __iter__(self):
-        import random
-        bucket_order = list(range(len(self.buckets)))
-        random.shuffle(bucket_order)
-        for bi in bucket_order:
-            bucket = self.buckets[bi][:]
-            random.shuffle(bucket)
-            yield from bucket
-
-    def __len__(self):
-        return sum(len(b) for b in self.buckets)
-
-
-class SpeechDataModule(pl.LightningDataModule):
-    def __init__(self, cfg: DictConfig, tokenizer, model_config):
-        super().__init__()
-        self.cfg = cfg
-        self.tokenizer = tokenizer
-        self.model_config = model_config
-        self.train_dataset = None
-        self.val_dataset = None
-        self.test_dataset = None
-
-    def _fraction_subset(self, dataset, fraction: float, seed_offset: int, name: str):
-        if dataset is None or fraction >= 1.0:
-            return dataset
-        if fraction <= 0.0:
-            raise ValueError(f"data.{name}_fraction must be in (0, 1], got {fraction}")
-
-        subset_size = max(1, int(round(len(dataset) * fraction)))
-        generator = torch.Generator().manual_seed(int(self.cfg.data.seed) + seed_offset)
-        indices = torch.randperm(len(dataset), generator=generator)[:subset_size].tolist()
-        print(f"Using {subset_size}/{len(dataset)} {name} samples ({fraction:.0%}).")
-        return Subset(dataset, indices)
-
-    @staticmethod
-    def _bounded_split_size(dataset_size: int, fraction: float, min_size: int, max_size: int) -> int:
-        if dataset_size <= 0 or fraction <= 0.0 or max_size <= 0:
-            return 0
-        size = int(round(dataset_size * fraction))
-        return max(min_size, min(max_size, size))
-
-    def setup(self, stage=None):   #!need to understand this
-        if self.train_dataset is not None:
-            return
-
-        dataset = SpeechDataset(
-            self.cfg.data.json_path,
-            self.tokenizer,
-            self.model_config,
-            input_type=self.cfg.data.input_type,
-            mel_size=self.cfg.data.mel_size,
-            audio_root=self.cfg.data.get("audio_root"),
-        )
-
-        val_split = float(self.cfg.data.validation_split)
-        test_split = float(self.cfg.data.get("test_split", 0.0))
-        if val_split < 0 or test_split < 0:
-            raise ValueError("data.validation_split and data.test_split must be non-negative.")
-        if val_split + test_split >= 1.0:
-            raise ValueError("data.validation_split + data.test_split must be < 1.0.")
-
-        if len(dataset) < 2 or (val_split <= 0 and test_split <= 0):
-            self.train_dataset = self._fraction_subset(
-                dataset,
-                float(self.cfg.data.get("train_fraction", 1.0)),
-                101,
-                "train",
-            )
-            self.val_dataset = None
-            self.test_dataset = None
-            return
-
-        dataset_size = len(dataset)
-        test_size = self._bounded_split_size(
-            dataset_size,
-            test_split,
-            min_size=1 if test_split > 0 else 0,
-            max_size=max(0, dataset_size - 1),
-        )
-        remaining_after_test = dataset_size - test_size
-        val_size = self._bounded_split_size(
-            dataset_size,
-            val_split,
-            min_size=1 if val_split > 0 else 0,
-            max_size=max(0, remaining_after_test - 1),
-        )
-        train_size = dataset_size - val_size - test_size
-
-        generator = torch.Generator().manual_seed(int(self.cfg.data.seed))  #manual_seed is used to ensure that the random split is reproducible
-        splits = [train_size]
-        if val_size > 0:
-            splits.append(val_size)
-        if test_size > 0:
-            splits.append(test_size)
-        subsets = random_split(dataset, splits, generator=generator)
-
-        self.train_dataset = self._fraction_subset(
-            subsets[0],
-            float(self.cfg.data.get("train_fraction", 1.0)),
-            101,
-            "train",
-        )
-        next_idx = 1
-        if val_size > 0:
-            self.val_dataset = self._fraction_subset(
-                subsets[next_idx],
-                float(self.cfg.data.get("val_fraction", 1.0)),
-                202,
-                "val",
-            )
-            next_idx += 1
-        else:
-            self.val_dataset = None
-        if test_size > 0:
-            self.test_dataset = self._fraction_subset(
-                subsets[next_idx],
-                float(self.cfg.data.get("test_fraction", 1.0)),
-                303,
-                "test",
-            )
-        else:
-            self.test_dataset = None
-
-    def train_dataloader(self):
-        batch_size = self.cfg.training.batch_size
-        if batch_size > 1:
-            sampler = LengthBucketSampler(self.train_dataset, batch_size)
-            return DataLoader(
-                self.train_dataset,
-                batch_size=batch_size,
-                sampler=sampler,
-                num_workers=self.cfg.data.num_workers,
-                collate_fn=SpeechCollator(self.tokenizer),
-                pin_memory=torch.cuda.is_available(),
-            )
-        return DataLoader(
-            self.train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=self.cfg.data.num_workers,
-            collate_fn=SpeechCollator(self.tokenizer),
-            pin_memory=torch.cuda.is_available(),
-        )
-
-    def val_dataloader(self):
-        if self.val_dataset is None:
-            return None
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.cfg.training.batch_size,
-            shuffle=False,
-            num_workers=self.cfg.data.num_workers,
-            collate_fn=SpeechCollator(self.tokenizer),
-            pin_memory=torch.cuda.is_available(),
-        )
-
-    def test_dataloader(self):
-        if self.test_dataset is None:
-            return None
-        return DataLoader(
-            self.test_dataset,
-            batch_size=self.cfg.training.batch_size,
-            shuffle=False,
-            num_workers=self.cfg.data.num_workers,
-            collate_fn=SpeechCollator(self.tokenizer),
-            pin_memory=torch.cuda.is_available(),
-        )
 
 
 class OmniSpeechTrainingModule(pl.LightningModule):
@@ -521,6 +213,10 @@ class OmniSpeechTrainingModule(pl.LightningModule):
     def _promote_trainable_params_to_fp32(self):
         promote_trainable_params_to_fp32(self, self.cfg.training)
 
+    def on_fit_start(self):
+        # Runs after Lightning's precision plugin has converted the module.
+        check_trainable_params_fp32(self, self.cfg.training)
+
     def _keep_speech_encoder_eval(self):
         if bool(self.cfg.training.get("tune_speech_encoder", False)):
             return
@@ -647,19 +343,22 @@ class OmniSpeechTrainingModule(pl.LightningModule):
         self._log_param_group_stats("lora_B", lora_b_grad_norms, lora_b_weight_norms)
         self._log_param_group_stats("speech_projector", projector_grad_norms, projector_weight_norms)
 
-    def configure_optimizers(self):
-        trainable_params = [param for param in self.parameters() if param.requires_grad]
-        optimizer = AdamW(
-            trainable_params,
+    def build_optimizer(self) -> AdamW:
+        return AdamW(
+            [param for param in self.parameters() if param.requires_grad],
             lr=self.cfg.training.learning_rate,
             weight_decay=self.cfg.training.weight_decay,
         )
 
-        if self.cfg.training.lr_scheduler_type != "cosine":
-            return optimizer
+    def _total_optimizer_steps(self) -> int:
+        return max(1, int(self.trainer.estimated_stepping_batches))
 
-        total_steps = max(1, int(self.trainer.estimated_stepping_batches))
+    def configure_optimizers(self):
+        """AdamW with linear warmup (``training.warmup_ratio``) then cosine decay."""
+        optimizer = self.build_optimizer()
+        total_steps = self._total_optimizer_steps()
         warmup_steps = int(total_steps * float(self.cfg.training.warmup_ratio))
+        print(f"Cosine LR schedule: total_steps={total_steps}, warmup_steps={warmup_steps}")
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
@@ -673,38 +372,3 @@ class OmniSpeechTrainingModule(pl.LightningModule):
                 "interval": "step",
             },
         }
-
-@hydra.main(version_base=None, config_path="../../configs", config_name="combined")
-def main(cfg: DictConfig):
-    pl.seed_everything(int(cfg.data.seed), workers=True)
-
-    module = OmniSpeechTrainingModule(cfg)
-    data_module = SpeechDataModule(cfg, module.tokenizer, module.model.config)
-    data_module.setup()
-    has_validation = data_module.val_dataset is not None
-
-    trainer = pl.Trainer(
-        default_root_dir=to_absolute_path(str(cfg.logging.output_dir)),
-        max_epochs=cfg.training.num_train_epochs,
-        accelerator=cfg.training.accelerator,
-        devices=cfg.training.devices,
-        strategy=cfg.training.strategy,
-        precision=cfg.training.precision,
-        accumulate_grad_batches=cfg.training.gradient_accumulation_steps,
-        gradient_clip_val=cfg.training.max_grad_norm,
-        logger=build_loggers(cfg),
-        callbacks=build_callbacks(cfg, has_validation),
-        log_every_n_steps=cfg.training.log_every_n_steps,
-        val_check_interval=cfg.training.val_check_interval,
-        fast_dev_run=cfg.training.fast_dev_run,
-        enable_checkpointing=False,
-    )
-
-    trainer.fit(module, datamodule=data_module)
-    finalize_fit_outputs(
-        trainer, module, to_absolute_path(str(cfg.logging.output_dir)), tokenizer=module.tokenizer,
-    )
-
-
-if __name__ == "__main__":
-    main()

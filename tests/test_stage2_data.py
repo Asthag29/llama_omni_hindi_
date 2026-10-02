@@ -1,4 +1,4 @@
-"""Stage-2 data pipeline: prompt, per-worker/per-rank partitioning, local mode.
+"""Stage-2 data pipeline: prompt, per-worker/per-rank partitioning, local data dir.
 
 CPU only, no network, no model weights. Partitioning is checked at the row-id
 level through a real ``torch.utils.data.DataLoader``.
@@ -96,8 +96,8 @@ def build_synthetic_data_dir(
     return ids
 
 
-class IdDataset(stage2.HFStreamingSpeechDataset):
-    """Real streaming/partitioning/audio-guard path, but items are row ids."""
+class IdDataset(stage2.Stage2SpeechDataset):
+    """Real parquet-reading/partitioning/audio-guard path, but items are row ids."""
 
     def _row_to_item(self, row):
         if self._decode_row_audio(row) is None:
@@ -115,9 +115,7 @@ def make_dataset(files, split, shuffle, repeat=False, rank=0, world_size=1, cls=
     return cls(
         data_files=files,
         tokenizer=None,
-        model_config=None,
         split_name=split,
-        cache_dir=None,
         seed=seed,
         shuffle_buffer_size=16 if shuffle else 0,
         repeat=repeat,
@@ -152,7 +150,7 @@ class SyntheticDataTestCase(unittest.TestCase):
         cls._tmp = tempfile.TemporaryDirectory()
         cls.data_dir = Path(cls._tmp.name) / "speech"
         cls.ids = build_synthetic_data_dir(cls.data_dir)
-        cls.source = stage2.resolve_data_source(OmegaConf.create({"data_dir": str(cls.data_dir)}))
+        cls.source = stage2.resolve_data_source(OmegaConf.create({"speech_dir": str(cls.data_dir)}))
         cls.train_files = cls.source.split_files["train"]
         cls.val_files = cls.source.split_files["validation"]
 
@@ -294,10 +292,9 @@ class AudioLengthGuardTests(unittest.TestCase):
             self.assertEqual(dataset._skipped_overlong_audio, 1)
 
 
-class LocalModeTests(SyntheticDataTestCase):
+class LocalDataTests(SyntheticDataTestCase):
     def test_counts_come_from_the_manifest(self):
         manifest = json.loads((self.data_dir / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(self.source.mode, "local")
         self.assertEqual(self.source.train_samples, manifest["splits"]["train"]["rows"])
         self.assertEqual(self.source.validation_samples, manifest["splits"]["validation"]["rows"])
         self.assertEqual(self.source.test_samples, manifest["splits"]["test"]["rows"])
@@ -307,18 +304,28 @@ class LocalModeTests(SyntheticDataTestCase):
         self.assertIn("src_a", table)
         self.assertIn(str(manifest["splits"]["train"]["rows"]), table)
 
-    def test_hub_mode_when_data_dir_is_null(self):
-        source = stage2.resolve_data_source(
-            OmegaConf.create({"data_dir": None, "train_samples": 105000, "validation_samples": 5720})
-        )
-        self.assertEqual((source.mode, source.train_samples, source.validation_samples), ("hub", 105000, 5720))
+    def test_unset_speech_dir_is_an_error(self):
+        for value in (None, ""):
+            with self.subTest(speech_dir=value):
+                with self.assertRaises(stage2.LocalDataError) as ctx:
+                    stage2.resolve_data_source(OmegaConf.create({"speech_dir": value}))
+                self.assertIn("data.speech_dir", str(ctx.exception))
+
+    def test_no_hub_streaming_code_left(self):
+        for name in ("list_matching_parquet_files", "_hf_data_url", "_resolve_hf_data_files",
+                     "HFStreamingSpeechDataset", "HFStreamingSpeechDataModule",
+                     "HFStreamingTrainingModule", "compute_streaming_optimizer_steps"):
+            self.assertFalse(hasattr(stage2, name), name)
+        source = (REPO_ROOT / "omni_speech" / "training" / "stage2.py").read_text(encoding="utf-8")
+        for text in ("hf://", "repo_id", "HfApi", "cfg.streaming", "streaming_run.json"):
+            self.assertNotIn(text, source)
 
     def test_relative_data_dir_resolves_from_repo_root(self):
         self.assertEqual(stage2.resolve_repo_path("data/speech"), REPO_ROOT / "data" / "speech")
 
     def assertBuildError(self, data_dir):
         with self.assertRaises(stage2.LocalDataError) as ctx:
-            stage2.resolve_data_source(OmegaConf.create({"data_dir": str(data_dir)}))
+            stage2.resolve_data_source(OmegaConf.create({"speech_dir": str(data_dir)}))
         self.assertIn("python -m omni_speech.datasets.processing.build_stage2_local", str(ctx.exception))
 
     def test_missing_directory_or_manifest_or_incomplete_build(self):
@@ -337,12 +344,11 @@ class LocalModeTests(SyntheticDataTestCase):
             (root / "train" / "part-00001.parquet").unlink()
             self.assertBuildError(root)
 
-    def test_default_config_uses_local_mode(self):
+    def test_default_config_points_at_the_local_data(self):
         with (REPO_ROOT / "configs" / "stage_2.yaml").open(encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
-        self.assertEqual(cfg["streaming"]["data_dir"], "data/speech")
-        for key in ("repo_id", "train_samples", "validation_samples", "train_parquet_patterns"):
-            self.assertIn(key, cfg["streaming"])
+        self.assertEqual(cfg["data"]["speech_dir"], "data/speech")
+        self.assertNotIn("streaming", cfg)
 
 
 class ScheduleTests(unittest.TestCase):
@@ -354,7 +360,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(schedule["optimizer_steps_per_epoch"], 2859)
         self.assertEqual(schedule["total_optimizer_steps"], 8577)
         self.assertEqual(schedule["warmup_steps"], 428)
-        self.assertEqual(stage2.compute_streaming_optimizer_steps(40019, 2, 7, 3), 8577)
+        self.assertEqual(stage2.compute_total_optimizer_steps(40019, 2, 7, 3), 8577)
 
 
 @unittest.skipUnless((REPO_ROOT / "models" / "llama" / "tokenizer_config.json").exists(), "models/llama absent")
@@ -366,12 +372,10 @@ class RealTokenizerTests(SyntheticDataTestCase):
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.model_max_length = 2048
-        dataset = stage2.HFStreamingSpeechDataset(
+        dataset = stage2.Stage2SpeechDataset(
             data_files=self.val_files,
             tokenizer=tokenizer,
-            model_config=None,
             split_name="validation",
-            cache_dir=None,
             seed=0,
             shuffle_buffer_size=0,
             repeat=False,

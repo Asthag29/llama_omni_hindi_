@@ -1,9 +1,8 @@
 data:
-  path: "data/instruct"
-  json_path: "${data.path}/hindi_instruct_conversations.json"
+  json_path: "data/instruct/hindi_instruct_conversations.json"
   validation_ids_path: "data/splits/validation_ids.txt"
   test_ids_path: "data/splits/test_ids.txt"
-  train_fraction: 1.0
+  train_fraction: 1.0  # < 1.0: train on a random subset (debugging)
   val_fraction: 1.0
   seed: 42
   num_workers: 4
@@ -18,19 +17,18 @@ training:
   num_train_epochs: 3
   batch_size: 2 #!keep this
   gradient_accumulation_steps: 7  #forward and backward are accumulated over this steps and then the gradients are updated(sum of 8 microbatch)
-  learning_rate: 0.000107467137359001
-  tune_speech_projector: false
+  learning_rate: 1.0e-4
   tune_llm_backbone: true
-  tune_speech_encoder: false
   use_lora: true
   lora_r: 128  #128
   lora_alpha: 64  #64
   lora_dropout: 0.05
   gradient_checkpointing: true
-  lr_scheduler_type: "cosine"
   warmup_ratio: 0.05  #9% of the first epoch 
   weight_decay: 0.00
   max_grad_norm: 1.8   #clipping the gradients to prevent exploding gradients
+  # Base model and forward pass follow this value; trainable weights and optimizer
+  # state are always fp32. Do not use "bf16-true"/"16-true" (they cast everything).
   precision: "bf16-mixed"
   accelerator: "auto"
   devices: "auto"
@@ -42,17 +40,14 @@ training:
 
 logging:
   output_dir: "outputs/stage_1/backbone_text"
-  log_file: "logs/train.log"
   csv: true
-  csv_metrics_file: "csv/metrics.csv"
   tensorboard: false
   wandb: true
   wandb_project: "hindi_llama_omni"
   wandb_run_id: null
   wandb_run_name: "stage-1-backbone-text"
-  checkpoint_monitor: "val_loss"
-  # Lower is better. During a fit: checkpoints/best -> best-so-far weights (from the
-  # first real validation), checkpoints/last -> latest validation (if save_last).
+  # Best = lowest val_loss. During a fit: checkpoints/best -> best-so-far weights (from
+  # the first real validation), checkpoints/last -> latest validation (if save_last).
   # After a completed fit: best_model/ and final_model/.
   save_last: true
 

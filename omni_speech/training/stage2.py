@@ -1,30 +1,23 @@
-"""Stage-2 OmniSpeech training over parquet speech data.
+"""Stage-2 OmniSpeech training on the local parquet speech data.
 
-Two data modes, selected by ``streaming.data_dir``:
-
-* local (default): ``<data_dir>/{train,validation,test}/*.parquet`` plus a
-  ``manifest.json`` written by
-  ``python -m omni_speech.datasets.processing.build_stage2_local``. Sample
-  counts for the schedule come from the manifest.
-* Hub (``streaming.data_dir: null``): parquet files streamed from
-  ``streaming.repo_id`` using the ``*_parquet_patterns`` and the
-  ``train_samples``/``validation_samples`` counts in the config.
-
-Both modes read rows with ``datasets`` in streaming mode; audio bytes are
-decoded from the parquet rows in the dataloader workers.
+``data.speech_dir`` holds ``{train,validation,test}/*.parquet`` plus a
+``manifest.json``, written by
+``python -m omni_speech.datasets.processing.build_stage2_local``. Row counts for
+the LR schedule come from the manifest. Rows are read with the ``datasets``
+library's iterable parquet reader; audio bytes are decoded in the DataLoader
+workers.
 """
 
 from __future__ import annotations
 
 import copy
-import fnmatch
 import io
 import json
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterator
 
 import hydra
 import numpy as np
@@ -33,16 +26,13 @@ import soundfile as sf
 import torch
 import torchaudio
 import whisper
-from huggingface_hub import HfApi
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
-from torch.optim import AdamW
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
-from transformers import get_cosine_schedule_with_warmup
 
 from omni_speech.constants import DEFAULT_SPEECH_PROMPT
 from omni_speech.datasets.preprocess import preprocess, preprocess_multimodal
-from omni_speech.training.combined import OmniSpeechTrainingModule, SpeechCollator
+from omni_speech.training.speech_module import OmniSpeechTrainingModule, SpeechCollator
 from omni_speech.train_utils import (
     build_callbacks,
     build_loggers,
@@ -58,34 +48,6 @@ MAX_AUDIO_SAMPLES = int(whisper.audio.N_SAMPLES)
 # Upper bound on parquet files interleaved into one shuffle buffer
 # (datasets' own default for IterableDataset.shuffle).
 MAX_INTERLEAVED_FILES = 10
-
-
-def list_matching_parquet_files(repo_id: str, repo_type: str, parquet_prefix: str, patterns: Iterable[str]) -> list[str]:
-    repo_files = HfApi().list_repo_files(repo_id=repo_id, repo_type=repo_type)
-    prefix = parquet_prefix.strip("/")
-    matches: list[str] = []
-    for pattern in patterns:
-        full_pattern = f"{prefix}/{pattern}" if prefix and not str(pattern).startswith(f"{prefix}/") else str(pattern)
-        matches.extend(fnmatch.filter(repo_files, full_pattern))
-    return sorted(set(matches))
-
-
-def _hf_data_url(repo_id: str, repo_type: str, path: str) -> str:
-    if repo_type != "dataset":
-        raise ValueError("HF parquet streaming currently expects repo_type='dataset'.")
-    return f"hf://datasets/{repo_id}/{path}"
-
-
-def _resolve_hf_data_files(cfg: DictConfig, patterns: Iterable[str]) -> list[str]:
-    repo_id = str(cfg.repo_id)
-    repo_type = str(cfg.get("repo_type", "dataset"))
-    parquet_prefix = str(cfg.get("parquet_prefix", "data"))
-    matches = list_matching_parquet_files(repo_id, repo_type, parquet_prefix, patterns)
-    if not matches:
-        raise RuntimeError(
-            f"No parquet files matched patterns {list(patterns)} in {repo_id}/{parquet_prefix}"
-        )
-    return [_hf_data_url(repo_id, repo_type, path) for path in matches]
 
 
 class LocalDataError(RuntimeError):
@@ -140,46 +102,38 @@ def list_local_split_files(data_dir: Path, split: str, manifest: dict) -> list[s
 
 @dataclass
 class Stage2DataSource:
-    """Where stage-2 rows come from and how many there are per split."""
+    """The local stage-2 data directory and its row counts per split."""
 
-    mode: str  # "local" or "hub"
+    data_dir: Path
+    manifest: dict
     train_samples: int
-    validation_samples: int | None
-    test_samples: int | None = None
-    data_dir: Path | None = None
-    manifest: dict | None = None
-    split_files: dict[str, list[str]] = field(default_factory=dict)
+    validation_samples: int
+    test_samples: int
+    split_files: dict[str, list[str]]
 
     def summary(self) -> dict:
-        summary = {
-            "mode": self.mode,
-            "data_dir": str(self.data_dir) if self.data_dir is not None else None,
+        return {
+            "speech_dir": str(self.data_dir),
             "train_samples": self.train_samples,
             "validation_samples": self.validation_samples,
             "test_samples": self.test_samples,
+            "manifest_splits": self.manifest.get("splits"),
+            "manifest_max_audio_seconds": self.manifest.get("max_audio_seconds"),
         }
-        if self.manifest is not None:
-            summary["manifest_splits"] = self.manifest.get("splits")
-            summary["manifest_max_audio_seconds"] = self.manifest.get("max_audio_seconds")
-        return summary
 
 
-def resolve_data_source(streaming_cfg: DictConfig) -> Stage2DataSource:
-    """Local mode when ``streaming.data_dir`` is set, otherwise Hub mode."""
-    data_dir = streaming_cfg.get("data_dir")
-    if data_dir in (None, ""):
-        validation_samples = streaming_cfg.get("validation_samples")
-        return Stage2DataSource(
-            mode="hub",
-            train_samples=int(streaming_cfg.train_samples),
-            validation_samples=int(validation_samples) if validation_samples is not None else None,
+def resolve_data_source(data_cfg: DictConfig) -> Stage2DataSource:
+    """Validate ``data.speech_dir`` and read its row counts from the manifest."""
+    speech_dir = data_cfg.get("speech_dir")
+    if speech_dir in (None, ""):
+        raise LocalDataError(
+            f"data.speech_dir is not set. Point it at the stage-2 data directory "
+            f"(default data/speech), built with: {BUILD_LOCAL_COMMAND}"
         )
-
-    data_dir = resolve_repo_path(data_dir)
+    data_dir = resolve_repo_path(speech_dir)
     manifest = load_local_manifest(data_dir)
     splits = manifest["splits"]
     return Stage2DataSource(
-        mode="local",
         train_samples=int(splits["train"]["rows"]),
         validation_samples=int(splits["validation"]["rows"]),
         test_samples=int(splits["test"]["rows"]),
@@ -199,17 +153,10 @@ def _source_rows(value) -> int | None:
 
 
 def format_split_table(source: Stage2DataSource) -> str:
-    """Rows per split (and per source in local mode) for the startup log."""
-    if source.mode == "hub":
-        return (
-            "Stage-2 data: Hub mode (counts from config)\n"
-            f"  train rows       {source.train_samples}\n"
-            f"  validation rows  {source.validation_samples}"
-        )
-
+    """Rows per split and per source for the startup log."""
     splits = source.manifest["splits"]
     lines = [
-        f"Stage-2 data: local {source.data_dir} "
+        f"Stage-2 data: {source.data_dir} "
         f"(max_audio_seconds={source.manifest.get('max_audio_seconds')})",
         f"  {'split':<12}{'rows':>10}{'files':>8}{'hours':>10}",
     ]
@@ -247,21 +194,15 @@ def _buffer_input_shards(num_files: int, num_consumers: int) -> int:
     return max(1, min(MAX_INTERLEAVED_FILES, num_files // max(1, num_consumers)))
 
 
-def _load_streaming_dataset(data_files: list[str], split_name: str, cache_dir: str | None):
-    try:
-        from datasets import Audio, load_dataset
-    except ImportError as exc:
-        raise ImportError(
-            "HF streaming training requires the `datasets` package. "
-            "Install it in the environment before running stage2.py."
-        ) from exc
+def _load_parquet_dataset(data_files: list[str], split_name: str):
+    """Iterable (``streaming=True``) reader over local parquet files; writes no cache."""
+    from datasets import Audio, load_dataset
 
     dataset = load_dataset(
         "parquet",
         data_files={split_name: data_files},
         split=split_name,
         streaming=True,
-        cache_dir=cache_dir,
     )
     # Keep raw audio bytes/path in rows. If HF Datasets decodes Audio itself, it
     # requires torchcodec in recent versions; our loader already decodes bytes.
@@ -318,8 +259,8 @@ def _row_to_conversations(row: dict) -> list[dict]:
     ]
 
 
-class HFStreamingSpeechDataset(IterableDataset):
-    """Streams parquet rows and turns them into stage-2 training items.
+class Stage2SpeechDataset(IterableDataset):
+    """Iterates parquet rows and turns them into stage-2 training items.
 
     Partitioning: rows are never filtered by index here. ``datasets`` assigns
     disjoint parquet files (shards) to each DataLoader worker
@@ -334,29 +275,21 @@ class HFStreamingSpeechDataset(IterableDataset):
         self,
         data_files: list[str],
         tokenizer,
-        model_config,
         split_name: str,
-        cache_dir: str | None,
         seed: int,
         shuffle_buffer_size: int,
         repeat: bool,
-        input_type: str = "mel",
         mel_size: int = 128,
-        compute_mel_on_gpu: bool = False,
         rank: int = 0,
         world_size: int = 1,
     ):
         self.data_files = data_files
         self.tokenizer = tokenizer
-        self.model_config = model_config
         self.split_name = split_name
-        self.cache_dir = cache_dir
         self.seed = int(seed)
         self.shuffle_buffer_size = int(shuffle_buffer_size)
         self.repeat = repeat
-        self.input_type = input_type
         self.mel_size = int(mel_size)
-        self.compute_mel_on_gpu = bool(compute_mel_on_gpu)
         self.rank = int(rank)
         self.world_size = int(world_size)
         if not 0 <= self.rank < self.world_size:
@@ -364,17 +297,13 @@ class HFStreamingSpeechDataset(IterableDataset):
         self._skipped_overlength = 0
         self._skipped_overlong_audio = 0
         self._rows_in_pass = 0
-        self.data_args = type(
-            "DataArgs",
-            (),
-            {"is_multimodal": True, "input_type": input_type, "mel_size": self.mel_size},
-        )()
+        self.data_args = type("DataArgs", (), {"is_multimodal": True})()
 
     def _log_skip(self, reason: str, count: int, row: dict, detail: str) -> None:
         if count <= 10 or count % 100 == 0:
             worker = get_worker_info()
             print(
-                f"Skipped {reason} streaming sample "
+                f"Skipped {reason} sample "
                 f"split={self.split_name} id={row.get('id', '<unknown>')} "
                 f"rank={self.rank} worker={worker.id if worker is not None else 0} "
                 f"{detail} skipped_{reason.replace('-', '_')}={count}",
@@ -417,28 +346,20 @@ class HFStreamingSpeechDataset(IterableDataset):
             )
             return None
 
-        if self.input_type == "raw" or (self.input_type == "mel" and self.compute_mel_on_gpu):
-            speech = torch.from_numpy(audio)
-            if getattr(self.model_config, "speech_normalize", False):
-                speech = torch.nn.functional.layer_norm(speech, speech.shape)
-            speech_length = speech.shape[0]
-        elif self.input_type == "mel":
-            audio = whisper.pad_or_trim(audio)
-            speech = whisper.log_mel_spectrogram(audio, n_mels=self.mel_size).permute(1, 0)
-            speech_length = speech.shape[0]
-        else:
-            raise ValueError(f"Unsupported input_type: {self.input_type}")
+        # Log-mel features (frames, n_mels) of the 30 s Whisper window.
+        audio = whisper.pad_or_trim(audio)
+        speech = whisper.log_mel_spectrogram(audio, n_mels=self.mel_size).permute(1, 0)
 
         return {
             "input_ids": text["input_ids"].squeeze(0),
             "labels": text["labels"].squeeze(0),
             "speech": speech,
-            "speech_length": torch.tensor(speech_length, dtype=torch.long),
+            "speech_length": torch.tensor(speech.shape[0], dtype=torch.long),
         }
 
     def _iter_rows(self, pass_idx: int) -> Iterator[dict]:
         """Raw parquet rows of one pass that belong to this rank and worker."""
-        dataset = _load_streaming_dataset(self.data_files, self.split_name, self.cache_dir)
+        dataset = _load_parquet_dataset(self.data_files, self.split_name)
         if self.shuffle_buffer_size > 0:
             worker = get_worker_info()
             num_workers = worker.num_workers if worker is not None else 1
@@ -477,36 +398,31 @@ class HFStreamingSpeechDataset(IterableDataset):
             pass_idx += 1
 
 
-class HFStreamingSpeechDataModule(pl.LightningDataModule):
+class Stage2SpeechDataModule(pl.LightningDataModule):
     def __init__(
         self,
         cfg: DictConfig,
         tokenizer,
-        model_config,
         data_source: Stage2DataSource | None = None,
     ):
         super().__init__()
         self.cfg = cfg
         self.tokenizer = tokenizer
-        self.model_config = model_config
-        self.data_source = data_source or resolve_data_source(cfg.streaming)
-        self.train_files: list[str] = list(self.data_source.split_files.get("train", []))
-        self.val_files: list[str] = list(self.data_source.split_files.get("validation", []))
+        self.data_source = data_source or resolve_data_source(cfg.data)
+        self.train_files: list[str] = list(self.data_source.split_files["train"])
+        self.val_files: list[str] = list(self.data_source.split_files["validation"])
         self.test_files: list[str] = []
 
     def _loader_kwargs(self) -> dict:
         num_workers = int(self.cfg.data.num_workers)
-        kwargs = {
+        return {
             "num_workers": num_workers,
             "collate_fn": SpeechCollator(self.tokenizer),
             "pin_memory": torch.cuda.is_available(),
+            # Keep the validation workers alive between validation runs instead
+            # of re-spawning them (and re-pickling the tokenizer) every time.
+            "persistent_workers": num_workers > 0,
         }
-        if num_workers > 0:
-            kwargs["prefetch_factor"] = int(self.cfg.data.get("prefetch_factor", 2))
-            kwargs["persistent_workers"] = bool(
-                self.cfg.data.get("persistent_workers", False)
-            )
-        return kwargs
 
     def _rank_and_world_size(self) -> tuple[int, int]:
         trainer = getattr(self, "trainer", None)
@@ -516,23 +432,6 @@ class HFStreamingSpeechDataModule(pl.LightningDataModule):
             return torch.distributed.get_rank(), torch.distributed.get_world_size()
         return 0, 1
 
-    def setup(self, stage=None):
-        if self.data_source.mode == "local":
-            return
-        streaming_cfg = self.cfg.streaming
-        if not self.train_files:
-            self.train_files = _resolve_hf_data_files(
-                streaming_cfg,
-                streaming_cfg.train_parquet_patterns,
-            )
-            print(f"HF streaming train files: {len(self.train_files)} parquet files")
-        if not self.val_files and streaming_cfg.get("validation_parquet_patterns"):
-            self.val_files = _resolve_hf_data_files(
-                streaming_cfg,
-                streaming_cfg.validation_parquet_patterns,
-            )
-            print(f"HF streaming validation files: {len(self.val_files)} parquet files")
-
     def _build_dataset(
         self,
         files: list[str],
@@ -540,20 +439,16 @@ class HFStreamingSpeechDataModule(pl.LightningDataModule):
         seed: int,
         shuffle_buffer_size: int,
         repeat: bool,
-    ) -> HFStreamingSpeechDataset:
+    ) -> Stage2SpeechDataset:
         rank, world_size = self._rank_and_world_size()
-        return HFStreamingSpeechDataset(
+        return Stage2SpeechDataset(
             data_files=files,
             tokenizer=self.tokenizer,
-            model_config=self.model_config,
             split_name=split_name,
-            cache_dir=self.cfg.streaming.get("cache_dir"),
             seed=seed,
             shuffle_buffer_size=shuffle_buffer_size,
             repeat=repeat,
-            input_type=self.cfg.data.input_type,
             mel_size=int(self.cfg.data.mel_size),
-            compute_mel_on_gpu=bool(self.cfg.data.get("compute_mel_on_gpu", False)),
             rank=rank,
             world_size=world_size,
         )
@@ -574,12 +469,11 @@ class HFStreamingSpeechDataModule(pl.LightningDataModule):
         )
 
     def train_dataloader(self):
-        self.setup()
         dataset = self._build_dataset(
             self.train_files,
             "train",
             seed=int(self.cfg.data.seed),
-            shuffle_buffer_size=int(self.cfg.streaming.shuffle_buffer_size),
+            shuffle_buffer_size=int(self.cfg.data.shuffle_buffer_size),
             repeat=True,
         )
         return DataLoader(
@@ -589,22 +483,17 @@ class HFStreamingSpeechDataModule(pl.LightningDataModule):
         )
 
     def val_dataloader(self):
-        self.setup()
-        if not self.val_files:
-            return None
         return self._eval_dataloader(self.val_files, "validation")
 
     def test_dataloader(self):
-        """Test split (local mode only); never used during ``fit``."""
+        """Held-out test split; never used during ``fit``."""
         source = self.data_source
-        if source.mode != "local":
-            raise RuntimeError("The stage-2 test split is only available in local mode (streaming.data_dir).")
         if not self.test_files:
             self.test_files = list_local_split_files(source.data_dir, "test", source.manifest)
         return self._eval_dataloader(self.test_files, "test")
 
 
-def compute_streaming_optimizer_steps(train_samples: int, batch_size: int, grad_accum: int, epochs: int) -> int:
+def compute_total_optimizer_steps(train_samples: int, batch_size: int, grad_accum: int, epochs: int) -> int:
     microbatches_per_epoch = math.ceil(train_samples / batch_size)
     return max(1, math.ceil(microbatches_per_epoch / grad_accum) * epochs)
 
@@ -618,13 +507,13 @@ def compute_schedule(
 ) -> dict:
     """Optimizer-step schedule for one process seeing ``train_samples`` rows per epoch."""
     microbatches_per_epoch = math.ceil(train_samples / batch_size)
-    total_steps = compute_streaming_optimizer_steps(train_samples, batch_size, grad_accum, epochs)
+    total_steps = compute_total_optimizer_steps(train_samples, batch_size, grad_accum, epochs)
     return {
         "train_samples": int(train_samples),
         "microbatches_per_epoch": microbatches_per_epoch,
         "optimizer_steps_per_epoch": math.ceil(microbatches_per_epoch / grad_accum),
         "total_optimizer_steps": total_steps,
-        # Same formula as HFStreamingTrainingModule.configure_optimizers.
+        # Same formula as OmniSpeechTrainingModule.configure_optimizers.
         "warmup_steps": int(total_steps * float(warmup_ratio)),
     }
 
@@ -667,7 +556,14 @@ def plan_schedule(cfg: DictConfig, data_source: Stage2DataSource) -> tuple[dict,
     return schedule, val_interval
 
 
-class HFStreamingTrainingModule(OmniSpeechTrainingModule):
+class Stage2TrainingModule(OmniSpeechTrainingModule):
+    """Speech module trained for a fixed number of optimizer steps.
+
+    The training stream repeats forever (Lightning never sees an epoch end), so
+    the cosine schedule length comes from the manifest row count instead of
+    ``trainer.estimated_stepping_batches``.
+    """
+
     def __init__(self, cfg: DictConfig, total_optimizer_steps: int, train_samples: int):
         self.total_optimizer_steps = total_optimizer_steps
         self.microbatches_per_epoch = math.ceil(
@@ -678,39 +574,13 @@ class HFStreamingTrainingModule(OmniSpeechTrainingModule):
         )
         super().__init__(cfg)
 
-    def _maybe_compute_mel_on_gpu(self, batch):
-        if self.cfg.data.input_type != "mel" or not bool(
-            self.cfg.data.get("compute_mel_on_gpu", False)
-        ):
-            return batch
-
-        speech = batch["speech"].to(self.device, dtype=torch.float32, non_blocking=True)
-        speech = whisper.pad_or_trim(speech)
-        mel = whisper.log_mel_spectrogram(
-            speech,
-            n_mels=int(self.cfg.data.mel_size),
-        ).permute(0, 2, 1)
-
-        batch = dict(batch)
-        batch["speech"] = mel
-        batch["speech_lengths"] = torch.full(
-            (mel.shape[0],),
-            mel.shape[1],
-            dtype=torch.long,
-            device=self.device,
-        )
-        return batch
-
-    def forward(self, batch):
-        return super().forward(self._maybe_compute_mel_on_gpu(batch))
-
-    def _log_streaming_progress(self, batch_idx: int) -> None:
+    def _log_epoch_progress(self, batch_idx: int) -> None:
         completed_microbatches = int(self.global_step) * int(
             self.cfg.training.gradient_accumulation_steps
         ) + int(batch_idx) % int(self.cfg.training.gradient_accumulation_steps)
         true_epoch = completed_microbatches / max(1, self.microbatches_per_epoch)
         self.log(
-            "streaming_true_epoch",
+            "true_epoch",
             true_epoch,
             on_step=True,
             on_epoch=False,
@@ -718,7 +588,7 @@ class HFStreamingTrainingModule(OmniSpeechTrainingModule):
             sync_dist=True,
         )
         self.log(
-            "streaming_microbatch_progress",
+            "microbatch_progress",
             float(completed_microbatches),
             on_step=True,
             on_epoch=False,
@@ -726,7 +596,7 @@ class HFStreamingTrainingModule(OmniSpeechTrainingModule):
             sync_dist=True,
         )
         self.log(
-            "streaming_optimizer_epoch",
+            "optimizer_epoch",
             float(self.global_step) / max(1, self.optimizer_steps_per_epoch),
             on_step=True,
             on_epoch=False,
@@ -735,39 +605,11 @@ class HFStreamingTrainingModule(OmniSpeechTrainingModule):
         )
 
     def training_step(self, batch, batch_idx):
-        self._log_streaming_progress(batch_idx)
+        self._log_epoch_progress(batch_idx)
         return super().training_step(batch, batch_idx)
 
-    def configure_optimizers(self):
-        trainable_params = [param for param in self.parameters() if param.requires_grad]
-        optimizer = AdamW(
-            trainable_params,
-            lr=self.cfg.training.learning_rate,
-            weight_decay=self.cfg.training.weight_decay,
-        )
-
-        if self.cfg.training.lr_scheduler_type != "cosine":
-            return optimizer
-
-        warmup_steps = int(
-            self.total_optimizer_steps * float(self.cfg.training.warmup_ratio)
-        )
-        print(
-            f"Using HF streaming global cosine schedule: total_steps={self.total_optimizer_steps}, "
-            f"warmup_steps={warmup_steps}"
-        )
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=self.total_optimizer_steps,
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-            },
-        }
+    def _total_optimizer_steps(self) -> int:
+        return self.total_optimizer_steps
 
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="stage_2")
@@ -776,14 +618,13 @@ def main(cfg: DictConfig):
 
     # Resolve (and validate) the data before loading the model, so a missing
     # local build fails fast.
-    data_source = resolve_data_source(cfg.streaming)
+    data_source = resolve_data_source(cfg.data)
     train_samples = data_source.train_samples
     schedule, val_interval = plan_schedule(cfg, data_source)
     total_optimizer_steps = schedule["total_optimizer_steps"]
 
     run_summary = {
         **data_source.summary(),
-        "repo_id": str(cfg.streaming.repo_id) if data_source.mode == "hub" else None,
         "global_num_train_epochs": int(cfg.training.num_train_epochs),
         "optimizer_steps_per_epoch": schedule["optimizer_steps_per_epoch"],
         "global_total_optimizer_steps": total_optimizer_steps,
@@ -792,14 +633,11 @@ def main(cfg: DictConfig):
     }
     output_dir = to_absolute_path(str(cfg.logging.output_dir))
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    with open(Path(output_dir) / "streaming_run.json", "w", encoding="utf-8") as f:
+    with open(Path(output_dir) / "stage2_run.json", "w", encoding="utf-8") as f:
         json.dump(run_summary, f, indent=2)
 
-    module = HFStreamingTrainingModule(cfg, total_optimizer_steps, train_samples)
-    data_module = HFStreamingSpeechDataModule(
-        cfg, module.tokenizer, module.model.config, data_source=data_source
-    )
-    data_module.setup()
+    module = Stage2TrainingModule(cfg, total_optimizer_steps, train_samples)
+    data_module = Stage2SpeechDataModule(cfg, module.tokenizer, data_source=data_source)
     has_validation = bool(data_module.val_files)
 
     trainer = pl.Trainer(
@@ -822,7 +660,7 @@ def main(cfg: DictConfig):
 
     trainer.fit(module, datamodule=data_module)
     finalize_fit_outputs(
-        trainer, module, output_dir, final_metadata={"streaming": True}, tokenizer=module.tokenizer,
+        trainer, module, output_dir, final_metadata={"stage": 2}, tokenizer=module.tokenizer,
     )
 
 

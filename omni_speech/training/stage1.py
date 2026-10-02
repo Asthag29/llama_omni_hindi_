@@ -328,6 +328,35 @@ def promote_trainable_params_to_fp32(module, training_cfg) -> None:
     )
 
 
+def check_trainable_params_fp32(module, training_cfg) -> None:
+    """Fail fast if the trainable LoRA adapter / speech projector is not fp32.
+
+    ``training.precision: "bf16-true"`` / ``"16-true"`` make Lightning cast the whole
+    module to half precision when fit starts, undoing
+    ``promote_trainable_params_to_fp32``. Call from ``on_fit_start`` (after Lightning
+    has converted the module). Full fine-tuning without LoRA is exempt, as in
+    ``promote_trainable_params_to_fp32``.
+    """
+    tune_llm = bool(training_cfg.get("tune_llm_backbone", False))
+    use_lora = bool(training_cfg.get("use_lora", False)) and tune_llm
+    if tune_llm and not use_lora:
+        return
+    wrong = [
+        (name, param.dtype)
+        for name, param in module.named_parameters()
+        if param.requires_grad and param.is_floating_point() and param.dtype != torch.float32
+    ]
+    if wrong:
+        dtypes = sorted({str(dtype) for _, dtype in wrong})
+        raise RuntimeError(
+            f"training.precision={str(training_cfg.get('precision'))!r} cast {len(wrong)} trainable "
+            f"parameters (LoRA adapter / speech projector) to {dtypes}, e.g. {wrong[0][0]}. "
+            "They and the optimizer state must stay fp32. Use training.precision: "
+            "\"bf16-mixed\" (the base model and forward pass still run in bf16); "
+            "do not use \"bf16-true\" or \"16-true\"."
+        )
+
+
 class BackboneTrainingModule(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -380,9 +409,9 @@ class BackboneTrainingModule(pl.LightningModule):
         self.model.print_trainable_parameters()
 
     def _configure_trainable_parameters(self):
-        tune_projector = bool(self.cfg.training.get("tune_speech_projector", False))
+        # Stage 1 is text only: the speech projector and encoder get no gradient,
+        # so they are always frozen.
         tune_llm = bool(self.cfg.training.get("tune_llm_backbone", False))
-        tune_encoder = bool(self.cfg.training.get("tune_speech_encoder", False))
         use_lora = bool(self.cfg.training.get("use_lora", False)) and tune_llm
 
         if not use_lora:
@@ -400,23 +429,20 @@ class BackboneTrainingModule(pl.LightningModule):
 
         if getattr(inner_model, "speech_projector", None) is not None:
             for param in inner_model.speech_projector.parameters():
-                param.requires_grad = tune_projector
+                param.requires_grad = False
 
         speech_encoder = inner_model.get_speech_encoder()
         if speech_encoder is not None:
-            if tune_encoder:
-                speech_encoder.train()
-            else:
-                speech_encoder.eval()
+            speech_encoder.eval()
             for param in speech_encoder.parameters():
-                param.requires_grad = tune_encoder
+                param.requires_grad = False
 
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.parameters())
         print(
             "Trainable parameters: "
             f"{trainable:,} / {total:,} ({100 * trainable / total:.2f}%) "
-            f"[projector={tune_projector}, llm={tune_llm}, lora={use_lora}, encoder={tune_encoder}]"
+            f"[llm={tune_llm}, lora={use_lora}; speech projector/encoder frozen]"
         )
 
     def _load_model_and_tokenizer(self):
@@ -458,6 +484,10 @@ class BackboneTrainingModule(pl.LightningModule):
 
     def _promote_trainable_params_to_fp32(self):
         promote_trainable_params_to_fp32(self, self.cfg.training)
+
+    def on_fit_start(self):
+        # Runs after Lightning's precision plugin has converted the module.
+        check_trainable_params_fp32(self, self.cfg.training)
 
     def forward(self, batch):
         return self.model(
@@ -600,17 +630,16 @@ class BackboneTrainingModule(pl.LightningModule):
                 sync_dist=True,
             )
 
-    def configure_optimizers(self):
-        trainable_params = [param for param in self.parameters() if param.requires_grad]
-        optimizer = AdamW(
-            trainable_params,
+    def build_optimizer(self) -> AdamW:
+        return AdamW(
+            [param for param in self.parameters() if param.requires_grad],
             lr=self.cfg.training.learning_rate,
             weight_decay=self.cfg.training.weight_decay,
         )
 
-        if self.cfg.training.lr_scheduler_type != "cosine":
-            return optimizer
-
+    def configure_optimizers(self):
+        """AdamW with linear warmup (``training.warmup_ratio``) then cosine decay."""
+        optimizer = self.build_optimizer()
         total_steps = max(1, int(self.trainer.estimated_stepping_batches))
         warmup_steps = int(total_steps * float(self.cfg.training.warmup_ratio))
         scheduler = get_cosine_schedule_with_warmup(

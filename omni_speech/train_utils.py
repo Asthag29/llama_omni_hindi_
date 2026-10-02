@@ -494,10 +494,18 @@ def build_loggers(cfg: DictConfig):
     return loggers
 
 
-def build_callbacks(cfg: DictConfig, has_validation: bool):
-    """Checkpoint (best/last weights), LR monitor and local metrics-table callbacks.
+# Local metrics table, relative to logging.output_dir.
+LOCAL_LOG_FILE = os.path.join("logs", "train.log")
+LOCAL_CSV_FILE = os.path.join("csv", "metrics.csv")
+# The checkpoint metric (lower is better). checkpoint_meta.json stores it under this
+# key, and resolve_checkpoint_path / inference rank checkpoints by it.
+CHECKPOINT_MONITOR = "val_loss"
 
-    Reads ``logging.checkpoint_monitor`` (lower is better) and ``logging.save_last``.
+
+def build_callbacks(cfg: DictConfig, has_validation: bool):
+    """Checkpoint (best/last weights by val_loss), LR monitor and local metrics-table callbacks.
+
+    Reads ``logging.save_last`` and ``logging.csv``.
     """
     output_dir = to_absolute_path(str(cfg.logging.output_dir))
     if not has_validation:
@@ -507,20 +515,12 @@ def build_callbacks(cfg: DictConfig, has_validation: bool):
         )
     checkpoint_callback = BestWeightsCheckpointCallback(
         output_dir=output_dir,
-        monitor=str(cfg.logging.checkpoint_monitor),
+        monitor=CHECKPOINT_MONITOR,
         save_last=bool(cfg.logging.get("save_last", True)),
     )
 
-    log_path = os.path.join(
-        output_dir,
-        str(cfg.logging.get("log_file", "logs/train.log")),
-    )
-    csv_path = None
-    if cfg.logging.get("csv", True):
-        csv_path = os.path.join(
-            output_dir,
-            str(cfg.logging.get("csv_metrics_file", "csv/metrics.csv")),
-        )
+    log_path = os.path.join(output_dir, LOCAL_LOG_FILE)
+    csv_path = os.path.join(output_dir, LOCAL_CSV_FILE) if cfg.logging.get("csv", True) else None
     callbacks = [
         checkpoint_callback,
         LearningRateMonitor(logging_interval="step"),

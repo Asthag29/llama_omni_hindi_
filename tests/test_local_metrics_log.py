@@ -216,7 +216,7 @@ class ModulesLogConsumedKeyTests(unittest.TestCase):
         key = train_utils.LocalMetricsLogCallback.TRAIN_LOSS_KEY
         for path, class_name in (
             ("omni_speech/training/stage1.py", "BackboneTrainingModule"),
-            ("omni_speech/training/combined.py", "OmniSpeechTrainingModule"),
+            ("omni_speech/training/speech_module.py", "OmniSpeechTrainingModule"),
         ):
             with self.subTest(class_name=class_name):
                 keys, source = self._logged_keys(path, class_name)

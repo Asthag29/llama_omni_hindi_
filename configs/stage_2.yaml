@@ -1,15 +1,13 @@
 data:
+  speech_dir: "data/speech"  # {train,validation,test}/*.parquet + manifest.json, from build_stage2_local
+  shuffle_buffer_size: 1024  # rows per worker shuffle buffer (~0.2 MB/row on average -> ~200 MB/worker)
   seed: 42
-  input_type: "mel"
   mel_size: 128
   # DataLoader workers per GPU. `datasets` gives each worker a disjoint set of
   # parquet files, so every row is read and yielded exactly once per pass
   # (stage2.py no longer filters rows by index). Workers beyond the number of
   # files stay idle; nothing is lost or duplicated.
   num_workers: 2
-  prefetch_factor: 2
-  persistent_workers: true
-  compute_mel_on_gpu: false
 
 model:
   config_path: "models/llama"
@@ -22,7 +20,7 @@ training:
   num_train_epochs: 3
   batch_size: 2
   gradient_accumulation_steps: 7
-  learning_rate: 0.000107467137359001
+  learning_rate: 1.0e-4
   tune_speech_projector: true
   tune_llm_backbone: true
   tune_speech_encoder: false
@@ -31,10 +29,11 @@ training:
   lora_alpha: 64
   lora_dropout: 0.05
   gradient_checkpointing: true
-  lr_scheduler_type: "cosine"
   warmup_ratio: 0.05
   weight_decay: 0.01
   max_grad_norm: 1.8
+  # Base model and forward pass follow this value; trainable weights and optimizer
+  # state are always fp32. Do not use "bf16-true"/"16-true" (they cast everything).
   precision: "bf16-mixed"
   accelerator: "auto"
   devices: "auto"
@@ -44,71 +43,16 @@ training:
   fast_dev_run: false
   attn_implementation: "sdpa"
 
-streaming:
-  # Local mode (default): read <data_dir>/{train,validation,test}/*.parquet,
-  # filtered to clips <= 30 s and split with the stage-1 ids. Row counts for
-  # the LR schedule come from <data_dir>/manifest.json. Relative paths are
-  # resolved from the repository root. Build the directory with:
-  #   python -m omni_speech.datasets.processing.build_stage2_local
-  # Set to null to stream from the Hub instead (keys marked "Hub mode only").
-  data_dir: "data/speech"
-  # Rows held in each worker's shuffle buffer (raw parquet rows, audio still
-  # FLAC-compressed): ~0.2 MB/row on average, ~0.5 MB max, so 1024 rows is
-  # ~200 MB per worker on average and at most ~512 MB per worker.
-  shuffle_buffer_size: 1024
-  cache_dir: null
-  # --- Hub mode only (used when data_dir is null) ---
-  repo_id: "Pastaaaaa2003/hindi-llama-omni"
-  repo_type: "dataset"
-  parquet_prefix: "data"
-  # Hub mode only: rows per training pass, used for the LR schedule.
-  train_samples: 105000
-  # Hub mode only: informational (recorded in streaming_run.json); the whole
-  # validation split is always evaluated.
-  validation_samples: 5720
-  # Hub mode only.
-  train_parquet_patterns:
-    - "data/batch_0000[0-9][0-9]-*.parquet"
-    - "data/batch_0001[0-9][0-9]-*.parquet"
-    - "data/batch_000200-*.parquet"
-    - "data/batch_000201-*.parquet"
-    - "data/batch_000202-*.parquet"
-    - "data/batch_000203-*.parquet"
-    - "data/batch_000204-*.parquet"
-    - "data/batch_000205-*.parquet"
-    - "data/batch_000206-*.parquet"
-    - "data/batch_000207-*.parquet"
-    - "data/batch_000208-*.parquet"
-    - "data/batch_000209-*.parquet"
-    - "data/batch_000210-*.parquet"
-  # Hub mode only.
-  validation_parquet_patterns:
-    - "data/batch_000211-*.parquet"
-    - "data/batch_000212-*.parquet"
-    - "data/batch_000213-*.parquet"
-    - "data/batch_000214-*.parquet"
-    - "data/batch_000215-*.parquet"
-    - "data/batch_000216-*.parquet"
-    - "data/batch_000217-*.parquet"
-    - "data/batch_000218-*.parquet"
-    - "data/batch_000219-*.parquet"
-    - "data/batch_000220-*.parquet"
-    - "data/batch_000221-*.parquet"
-    - "data/batch_000222-*.parquet"
-
 logging:
   output_dir: "outputs/stage_2/speech_text"
-  log_file: "logs/train.log"
   csv: true
-  csv_metrics_file: "csv/metrics.csv"
   tensorboard: false
   wandb: true
   wandb_project: "hindi_llama_omni"
   wandb_run_id: null
   wandb_run_name: "stage-2-speech-text"
-  checkpoint_monitor: "val_loss"
-  # Lower is better. During a fit: checkpoints/best -> best-so-far weights (from the
-  # first real validation), checkpoints/last -> latest validation (if save_last).
+  # Best = lowest val_loss. During a fit: checkpoints/best -> best-so-far weights (from
+  # the first real validation), checkpoints/last -> latest validation (if save_last).
   # After a completed fit: best_model/ and final_model/.
   save_last: true
 

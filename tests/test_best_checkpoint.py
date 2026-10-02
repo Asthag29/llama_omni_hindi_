@@ -244,7 +244,7 @@ class BestCheckpointDuringFitTests(unittest.TestCase):
 
 class ConfigAndLookupTests(unittest.TestCase):
     def test_configs_init_from_best_model_without_resume_state(self):
-        for name in ("stage_1.yaml", "stage_2.yaml", "combined.yaml"):
+        for name in ("stage_1.yaml", "stage_2.yaml"):
             text = (REPO_ROOT / "configs" / name).read_text(encoding="utf-8")
             self.assertNotIn("save_resume_state", text)
             if name != "stage_1.yaml":
@@ -258,7 +258,7 @@ class ConfigAndLookupTests(unittest.TestCase):
             (path / "checkpoint_meta.json").write_text(json.dumps({"val_loss": val_loss}))
 
     def test_missing_best_model_names_stable_best_path(self):
-        from omni_speech.training.combined import OmniSpeechTrainingModule
+        from omni_speech.training.speech_module import OmniSpeechTrainingModule
 
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "stage_1"

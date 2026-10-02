@@ -45,27 +45,20 @@ def heart_beat_worker(controller):
         controller.send_heart_beat()
 
 
-def load_speech(audio, input_type, mel_size, speech_normalize):
-    speech = np.array(audio, dtype=np.float32)
-    if input_type == "raw":
-        speech = torch.from_numpy(speech)
-        if speech_normalize:
-            speech = torch.nn.functional.layer_norm(speech, speech.shape)
-    elif input_type == "mel":
-        speech = whisper.pad_or_trim(speech)
-        speech = whisper.log_mel_spectrogram(speech, n_mels=mel_size).permute(1, 0)
-    return speech
+def load_speech(audio, mel_size):
+    """Log-mel features (frames, n_mels) of the 30 s Whisper window, as in training."""
+    speech = whisper.pad_or_trim(np.array(audio, dtype=np.float32))
+    return whisper.log_mel_spectrogram(speech, n_mels=mel_size).permute(1, 0)
 
 
 class ModelWorker:
     def __init__(self, controller_addr, worker_addr, no_register,
-                 model_name, device, input_type, mel_size,
+                 model_name, device, mel_size,
                  checkpoint_path, config_path=None):
         self.controller_addr = controller_addr
         self.worker_addr = worker_addr
         self.device = device
         self.model_name = model_name
-        self.input_type = input_type
         self.mel_size = mel_size
         config_path = config_path or "configs/stage_2.yaml"
         cfg = load_inference_cfg(Path(config_path).expanduser().resolve())
@@ -139,7 +132,7 @@ class ModelWorker:
         ori_prompt = prompt
         audio = params.get("audio", None)
         if audio is not None and len(audio) > 0:
-            speech = load_speech(audio, self.input_type, self.mel_size, self.model.config.speech_normalize)
+            speech = load_speech(audio, self.mel_size)
             speech_length = torch.LongTensor([speech.shape[0]]).unsqueeze(0).to(self.device)
             speech_dtype = speech_input_dtype(model)
             speech_tensor = speech.unsqueeze(0).to(self.device, dtype=speech_dtype)
@@ -252,7 +245,8 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="configs/stage_2.yaml")
     parser.add_argument("--limit-model-concurrency", type=int, default=5)
     parser.add_argument("--no-register", action="store_true")
-    parser.add_argument("--input-type", type=str, default="mel")
+    parser.add_argument("--input-type", type=str, default=None,
+        help="Deprecated and ignored; the speech encoder always takes log-mel features.")
     parser.add_argument("--mel-size", type=int, default=128)
     args = parser.parse_args()
     logger.info(f"args: {args}")
@@ -262,7 +256,6 @@ if __name__ == "__main__":
                          args.no_register,
                          args.model_name,
                          args.device,
-                         args.input_type,
                          args.mel_size,
                          checkpoint_path=args.checkpoint,
                          config_path=args.config)

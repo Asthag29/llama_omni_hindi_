@@ -31,7 +31,7 @@ from omni_speech.train_utils import (
     model_dtype,
     save_omni_speech_checkpoint,
 )
-from omni_speech.training.combined import OmniSpeechTrainingModule
+from omni_speech.training.speech_module import OmniSpeechTrainingModule
 from omni_speech.training.stage1 import BackboneTrainingModule
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -111,7 +111,6 @@ def make_cfg(stage=2, precision="bf16-mixed", use_lora=True, tune_llm=True,
             "gradient_checkpointing": gradient_checkpointing,
             "learning_rate": lr,
             "weight_decay": 0.01,
-            "lr_scheduler_type": "constant",
         },
     })
 
@@ -211,7 +210,7 @@ class PromotionTests(unittest.TestCase):
                 )
                 self.assertEqual(projector_trainable, stage == 2)
 
-                optimizer = module.configure_optimizers()
+                optimizer = module.build_optimizer()
                 forward_loss(module, make_batch(with_speech=stage == 2)).backward()
                 optimizer.step()
                 self.assertTrue(optimizer.state)

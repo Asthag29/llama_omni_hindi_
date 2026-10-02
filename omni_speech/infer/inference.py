@@ -19,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from omni_speech.conversation import conv_templates
 from omni_speech.constants import DEFAULT_SPEECH_PROMPT
 from omni_speech.datasets.preprocess import tokenizer_speech_token
-from omni_speech.training.combined import OmniSpeechTrainingModule
+from omni_speech.training.speech_module import OmniSpeechTrainingModule
 from omni_speech.train_utils import (
     BEST_MODEL_DIRNAME,
     FINAL_MODEL_DIRNAME,
@@ -135,9 +135,6 @@ def load_inference_cfg(config_path: Path):
     # and speech projector, so do not load the backbone init checkpoint first.
     cfg.model.init_checkpoint = None
     cfg.training.gradient_checkpointing = False
-    cfg.training.accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    cfg.training.devices = 1
-    cfg.training.strategy = "auto"
     if not torch.cuda.is_available():
         cfg.training.precision = "32-true"
     return cfg
@@ -188,25 +185,11 @@ def speech_input_dtype(model) -> torch.dtype:
 
 
 def prepare_speech(audio_path: Path, cfg, module, device: torch.device):
+    """Log-mel features (1, frames, n_mels) of the 30 s Whisper window, as in training."""
     audio = load_audio_16k(audio_path)
-    input_type = str(cfg.data.input_type)
-    mel_size = int(cfg.data.mel_size)
     dtype = speech_input_dtype(module.model)
-
-    if input_type == "raw":
-        speech = torch.from_numpy(audio)
-        inner_model = module._get_inner_speech_model()
-        if getattr(inner_model.config, "speech_normalize", False):
-            speech = torch.nn.functional.layer_norm(speech, speech.shape)
-    elif input_type == "mel":
-        if bool(cfg.data.get("compute_mel_on_gpu", False)):
-            raise ValueError(
-                "Script generation expects precomputed mel features; set cfg.data.compute_mel_on_gpu=False."
-            )
-        audio = whisper.pad_or_trim(audio)
-        speech = whisper.log_mel_spectrogram(audio, n_mels=mel_size).permute(1, 0)
-    else:
-        raise ValueError(f"Unsupported input_type: {input_type}")
+    audio = whisper.pad_or_trim(audio)
+    speech = whisper.log_mel_spectrogram(audio, n_mels=int(cfg.data.mel_size)).permute(1, 0)
 
     speech_lengths = torch.tensor([speech.shape[0]], device=device, dtype=torch.long)
     speech = speech.unsqueeze(0).to(device=device, dtype=dtype)
@@ -268,7 +251,7 @@ def parse_args():
     parser.add_argument("--audio", type=Path, default=AUDIO_PATH)
     parser.add_argument("--config", type=Path, default=CONFIG_PATH)
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
-    parser.add_argument("--run-id", "--streaming-run-id", dest="run_id", default=STAGE2_RUN_ID,
+    parser.add_argument("--run-id", dest="run_id", default=STAGE2_RUN_ID,
                         help="Run directory under outputs/stage_2 to search when --checkpoint is not set.")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
