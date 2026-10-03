@@ -9,6 +9,12 @@ from safetensors.torch import load_file
 from transformers import AutoConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
+# Fixed reference voice shared by inference.py and the Gradio demo: the second sentence of
+# data/inference.wav. IndicF5 re-reads the reference on every chunk and fills a 25 s window,
+# so a short clip leaves more room for new speech and long answers need fewer chunks.
+DEFAULT_REFERENCE_AUDIO = Path(__file__).resolve().parents[2] / "data" / "reference_voice.wav"
+DEFAULT_REFERENCE_TEXT = "क्या तुम कोई हो शहजादी, या परी लोक से आई हो।"
+
 
 class IndicF5SpeechGenerator:
     """Lazy IndicF5 TTS wrapper for cloning the user's reference voice."""
