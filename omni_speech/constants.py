@@ -8,6 +8,9 @@ IGNORE_INDEX = -100
 SPEECH_TOKEN_INDEX = -200
 DEFAULT_SPEECH_TOKEN = "<speech>"
 
+# Answer length limit shared by inference.py, the model worker and the Gradio demo.
+DEFAULT_MAX_NEW_TOKENS = 512
+
 DEFAULT_SPEECH_PROMPT = (
     "<speech>\n"
     "आप हिंदी लामा मॉडल हैं। उपयोगकर्ता की आवाज़ सुनें और उनके प्रश्न का उत्तर हिंदी(देवनागरी लिपि) में दें।"

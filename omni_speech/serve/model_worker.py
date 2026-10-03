@@ -14,18 +14,16 @@ from fastapi.responses import StreamingResponse
 import requests
 import torch
 import uvicorn
-import whisper
-import numpy as np
 from functools import partial
 
-from omni_speech.constants import WORKER_HEART_BEAT_INTERVAL
+from omni_speech.constants import DEFAULT_MAX_NEW_TOKENS, WORKER_HEART_BEAT_INTERVAL
 from omni_speech.serve.utils import (build_logger, server_error_msg,
     pretty_print_semaphore)
 from omni_speech.datasets.preprocess import tokenizer_speech_token
 from omni_speech.infer.inference import (
     load_inference_cfg,
     load_module_from_checkpoint,
-    speech_input_dtype,
+    speech_inputs,
 )
 from transformers import TextIteratorStreamer
 from threading import Thread
@@ -45,12 +43,6 @@ def heart_beat_worker(controller):
         controller.send_heart_beat()
 
 
-def load_speech(audio, mel_size):
-    """Log-mel features (frames, n_mels) of the 30 s Whisper window, as in training."""
-    speech = whisper.pad_or_trim(np.array(audio, dtype=np.float32))
-    return whisper.log_mel_spectrogram(speech, n_mels=mel_size).permute(1, 0)
-
-
 class ModelWorker:
     def __init__(self, controller_addr, worker_addr, no_register,
                  model_name, device, mel_size,
@@ -59,9 +51,9 @@ class ModelWorker:
         self.worker_addr = worker_addr
         self.device = device
         self.model_name = model_name
-        self.mel_size = mel_size
         config_path = config_path or "configs/stage_2.yaml"
         cfg = load_inference_cfg(Path(config_path).expanduser().resolve())
+        self.mel_size = mel_size or cfg.data.mel_size
         module, loaded_device = load_module_from_checkpoint(
             Path(checkpoint_path).expanduser().resolve(),
             cfg,
@@ -132,17 +124,15 @@ class ModelWorker:
         ori_prompt = prompt
         audio = params.get("audio", None)
         if audio is not None and len(audio) > 0:
-            speech = load_speech(audio, self.mel_size)
-            speech_length = torch.LongTensor([speech.shape[0]]).unsqueeze(0).to(self.device)
-            speech_dtype = speech_input_dtype(model)
-            speech_tensor = speech.unsqueeze(0).to(self.device, dtype=speech_dtype)
+            # Same audio preparation as inference.py, so both give the same answer.
+            speech_tensor, speech_length = speech_inputs(audio, self.mel_size, model, self.device)
             speech_args = {"speech": speech_tensor, "speech_lengths": speech_length}
         else:
             speech_args = {}
 
         temperature = float(params.get("temperature", 1.0))
         top_p = float(params.get("top_p", 1.0))
-        max_new_tokens = min(int(params.get("max_new_tokens", 256)), 1024)
+        max_new_tokens = min(int(params.get("max_new_tokens", DEFAULT_MAX_NEW_TOKENS)), 1024)
         stop_str = params.get("stop", None)
         do_sample = True if temperature > 0.001 else False
 
@@ -247,7 +237,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-register", action="store_true")
     parser.add_argument("--input-type", type=str, default=None,
         help="Deprecated and ignored; the speech encoder always takes log-mel features.")
-    parser.add_argument("--mel-size", type=int, default=128)
+    parser.add_argument("--mel-size", type=int, default=None,
+        help="Defaults to data.mel_size in the config.")
     args = parser.parse_args()
     logger.info(f"args: {args}")
 

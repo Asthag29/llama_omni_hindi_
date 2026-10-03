@@ -9,6 +9,14 @@ from safetensors.torch import load_file
 from transformers import AutoConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
+# Fixed reference voice shared by inference.py and the Gradio demo.
+DEFAULT_REFERENCE_AUDIO = Path(__file__).resolve().parents[2] / "data" / "inference.wav"
+DEFAULT_REFERENCE_TEXT = (
+    "तितली रानी तितली रानी, तितली रानी, इतने सुंदर पंख कहां से लाई हो। "
+    "क्या तुम कोई हो शहजादी, या परी लोक से आई हो। "
+    "फूल तुम्हें भी अच्छे लगते, फूल हमें भी भाते है।"
+)
+
 
 class IndicF5SpeechGenerator:
     """Lazy IndicF5 TTS wrapper for cloning the user's reference voice."""

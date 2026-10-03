@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Run OmniSpeech inference on data/inference.wav using a stage-2 checkpoint."""
+"""Run OmniSpeech inference on an audio question using a stage-2 checkpoint.
+
+--mode audio-to-text   print the Hindi text answer (default)
+--mode audio-to-audio  also speak the answer with IndicF5 and save it as a wav
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
+import numpy as np
+import soundfile as sf
 import torch
 import whisper
 from omegaconf import OmegaConf
@@ -17,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from omni_speech.conversation import conv_templates
-from omni_speech.constants import DEFAULT_SPEECH_PROMPT
+from omni_speech.constants import DEFAULT_MAX_NEW_TOKENS, DEFAULT_SPEECH_PROMPT
 from omni_speech.datasets.preprocess import tokenizer_speech_token
 from omni_speech.training.speech_module import OmniSpeechTrainingModule
 from omni_speech.train_utils import (
@@ -30,9 +37,19 @@ from omni_speech.train_utils import (
     resolve_checkpoint_path,
     stable_best_checkpoint_path,
 )
+from omni_speech.tts.indicf5 import (
+    DEFAULT_REFERENCE_AUDIO,
+    DEFAULT_REFERENCE_TEXT,
+    IndicF5SpeechGenerator,
+)
 
 AUDIO_PATH = REPO_ROOT / "data" / "inference.wav"
 CONFIG_PATH = REPO_ROOT / "configs" / "stage_2.yaml"
+INDICF5_MODEL_PATH = REPO_ROOT / "models" / "indicf5"
+OUTPUT_DIR = REPO_ROOT / "outputs" / "inference"
+
+AUDIO_TO_TEXT = "audio-to-text"
+AUDIO_TO_AUDIO = "audio-to-audio"
 
 # Leave CHECKPOINT_PATH as None to auto-pick models/hindi, then a stage-2 run under outputs/stage_2
 # (see find_stage2_checkpoint for the order).
@@ -42,7 +59,7 @@ STAGE2_RUN_ID = "speech_text"
 CONV_MODE = "llama_3"
 DEFAULT_PROMPT = DEFAULT_SPEECH_PROMPT
 
-MAX_NEW_TOKENS = 256
+MAX_NEW_TOKENS = DEFAULT_MAX_NEW_TOKENS
 TEMPERATURE = 0.0
 TOP_P = None
 NUM_BEAMS = 1
@@ -184,16 +201,21 @@ def speech_input_dtype(model) -> torch.dtype:
     return torch.float32
 
 
-def prepare_speech(audio_path: Path, cfg, module, device: torch.device):
-    """Log-mel features (1, frames, n_mels) of the 30 s Whisper window, as in training."""
-    audio = load_audio_16k(audio_path)
-    dtype = speech_input_dtype(module.model)
-    audio = whisper.pad_or_trim(audio)
-    speech = whisper.log_mel_spectrogram(audio, n_mels=int(cfg.data.mel_size)).permute(1, 0)
+def speech_inputs(audio, mel_size: int, model, device):
+    """Model inputs for 16 kHz mono samples; also what the model worker feeds the model.
+
+    Log-mel features (1, frames, n_mels) of the 30 s Whisper window, as in training.
+    """
+    audio = whisper.pad_or_trim(np.asarray(audio, dtype=np.float32))
+    speech = whisper.log_mel_spectrogram(audio, n_mels=int(mel_size)).permute(1, 0)
 
     speech_lengths = torch.tensor([speech.shape[0]], device=device, dtype=torch.long)
-    speech = speech.unsqueeze(0).to(device=device, dtype=dtype)
+    speech = speech.unsqueeze(0).to(device=device, dtype=speech_input_dtype(model))
     return speech, speech_lengths
+
+
+def prepare_speech(audio_path: Path, cfg, module, device: torch.device):
+    return speech_inputs(load_audio_16k(audio_path), cfg.data.mel_size, module.model, device)
 
 
 def build_prompt(user_text: str = DEFAULT_PROMPT, conv_mode: str = CONV_MODE) -> str:
@@ -242,13 +264,26 @@ def generate_from_wav(
         speech_lengths=speech_lengths,
         **gen_kwargs,
     )
-    new_token_ids = output_ids[:, input_ids.shape[1] :] if output_ids.shape[1] > input_ids.shape[1] else output_ids
-    return tokenizer.batch_decode(new_token_ids, skip_special_tokens=True)[0].strip()
+    # generate() runs on inputs_embeds, so it returns only the new tokens (no prompt to strip).
+    return tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+
+
+def synthesize_answer(text: str, output_path: Path, speech_generator) -> Path:
+    """Speak the text answer in the fixed IndicF5 reference voice and save it as a wav."""
+    sample_rate, audio = speech_generator.synthesize(text, DEFAULT_REFERENCE_AUDIO, DEFAULT_REFERENCE_TEXT)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(output_path), audio, sample_rate)
+    return output_path
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--mode", choices=(AUDIO_TO_TEXT, AUDIO_TO_AUDIO), default=AUDIO_TO_TEXT)
     parser.add_argument("--audio", type=Path, default=AUDIO_PATH)
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Wav to write in audio-to-audio mode (default: outputs/inference/<audio name>_answer.wav).")
+    parser.add_argument("--indicf5-model-path", type=Path, default=INDICF5_MODEL_PATH)
+    parser.add_argument("--indicf5-device", default=None)
     parser.add_argument("--config", type=Path, default=CONFIG_PATH)
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
     parser.add_argument("--run-id", dest="run_id", default=STAGE2_RUN_ID,
@@ -299,6 +334,19 @@ def main():
     )
     print("\n=== Model response ===")
     print(response)
+
+    if args.mode == AUDIO_TO_AUDIO:
+        if not response:
+            raise SystemExit("The model returned an empty answer, so there is nothing to speak.")
+        output_path = args.output or OUTPUT_DIR / f"{audio_path.stem}_answer.wav"
+        # IndicF5 forks helper processes; without this the tokenizer warns on every fork.
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        speech_generator = IndicF5SpeechGenerator(
+            model_path=args.indicf5_model_path.expanduser().resolve(),
+            device=args.indicf5_device,
+        )
+        output_path = synthesize_answer(response, output_path.expanduser().resolve(), speech_generator)
+        print(f"\n=== Spoken answer ===\n{output_path}")
 
 
 if __name__ == "__main__":

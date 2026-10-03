@@ -425,7 +425,7 @@ class SpeechDtypeHelperTests(unittest.TestCase):
         # cwd, so check it in a subprocess running in a temporary directory.
         code = (
             "import omni_speech.serve.model_worker as w, omni_speech.infer.inference as i, sys;"
-            "sys.exit(0 if w.speech_input_dtype is i.speech_input_dtype else 3)"
+            "sys.exit(0 if w.speech_inputs is i.speech_inputs else 3)"
         )
         with tempfile.TemporaryDirectory() as tmp:
             env = dict(os.environ, PYTHONPATH=str(REPO_ROOT))
@@ -435,7 +435,8 @@ class SpeechDtypeHelperTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr[-2000:])
         source = (REPO_ROOT / "omni_speech" / "serve" / "model_worker.py").read_text(encoding="utf-8")
-        self.assertIn("speech_input_dtype(model)", source)
+        # The worker gets its speech features and their dtype from inference.speech_inputs.
+        self.assertIn("speech_inputs(audio, self.mel_size, model, self.device)", source)
         self.assertNotIn("torch.float16 if", source)
 
 

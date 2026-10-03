@@ -3,31 +3,24 @@ import html
 import json
 import os
 import time
-from pathlib import Path
-
-import torch
-import torchaudio
 
 import gradio as gr
-import numpy as np
 import requests
 
 from omni_speech.conversation import default_conversation, conv_templates
-from omni_speech.constants import DEFAULT_SPEECH_PROMPT
+from omni_speech.constants import DEFAULT_MAX_NEW_TOKENS, DEFAULT_SPEECH_PROMPT
 from omni_speech.serve.utils import build_logger, server_error_msg
-from omni_speech.tts.indicf5 import IndicF5SpeechGenerator
+from omni_speech.train_utils import load_audio_16k
+from omni_speech.tts.indicf5 import (
+    DEFAULT_REFERENCE_AUDIO,
+    DEFAULT_REFERENCE_TEXT,
+    IndicF5SpeechGenerator,
+)
 
 
 logger = build_logger("gradio_web_server", "gradio_web_server.log")
 
 speech_generator = None
-
-DEFAULT_REFERENCE_AUDIO = Path(__file__).resolve().parents[2] / "data" / "inference.wav"
-DEFAULT_REFERENCE_TEXT = (
-    "तितली रानी तितली रानी, तितली रानी, इतने सुंदर पंख कहां से लाई हो। "
-    "क्या तुम कोई हो शहजादी, या परी लोक से आई हो। "
-    "फूल तुम्हें भी अच्छे लगते, फूल हमें भी भाते है।"
-)
 
 headers = {"User-Agent": "Hindi LLaMA-Omni Client"}
 
@@ -111,20 +104,6 @@ def clear_history(request: gr.Request):
     return (state, None, render_status(IDLE_STATUS, "idle"), "", None, ask_button(True))
 
 
-def normalize_audio(audio):
-    audio = np.asarray(audio)
-    if audio.ndim > 1:
-        audio = audio.mean(axis=-1)
-    if np.issubdtype(audio.dtype, np.integer):
-        audio = audio.astype(np.float32) / np.iinfo(audio.dtype).max
-    else:
-        audio = audio.astype(np.float32)
-        peak = np.max(np.abs(audio)) if audio.size else 0.0
-        if peak > 1.0:
-            audio = audio / 32768.0
-    return audio
-
-
 def get_default_reference() -> tuple[str, str]:
     if not DEFAULT_REFERENCE_AUDIO.is_file():
         raise FileNotFoundError(
@@ -203,17 +182,15 @@ def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
     # Construct prompt
     prompt = state.get_prompt()
 
-    sr, audio = state.messages[0][1][1]
+    audio_path = state.messages[0][1][1]
     if speech_generator is not None:
         ref_audio_path, ref_text = get_default_reference()
         logger.info(f"Using IndicF5 default reference: {ref_audio_path}")
     else:
         ref_audio_path, ref_text = None, ""
 
-    resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
-    audio = torch.tensor(normalize_audio(audio)).unsqueeze(0)
-    audio = resampler(audio).squeeze(0).numpy()
-    audio = audio.tolist()
+    # Same loader as inference.py, so the demo and the script give the same answer.
+    audio = load_audio_16k(audio_path).tolist()
     # Make requests
     pload = {
         "model": model_name,
@@ -335,6 +312,7 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
                 gr.Markdown("### 1 · Ask your question", elem_classes="panel-heading")
                 audio_input_box = gr.Audio(
                     sources=["upload", "microphone"],
+                    type="filepath",
                     label="Your question (Hindi)",
                 )
                 gr.Examples(
@@ -357,7 +335,7 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
                     )
                     temperature = gr.Slider(minimum=0.0, maximum=1.0, value=0.0, step=0.1, interactive=True, label="Temperature")
                     top_p = gr.Slider(minimum=0.0, maximum=1.0, value=0.7, step=0.1, interactive=True, label="Top P")
-                    max_output_tokens = gr.Slider(minimum=64, maximum=1024, value=512, step=64, interactive=True, label="Max Output Tokens")
+                    max_output_tokens = gr.Slider(minimum=64, maximum=1024, value=DEFAULT_MAX_NEW_TOKENS, step=64, interactive=True, label="Max Output Tokens")
                     gr.Textbox(
                         label="IndicF5 reference transcript (fixed voice)",
                         value=DEFAULT_REFERENCE_TEXT,
