@@ -2,9 +2,12 @@ import argparse
 import html
 import json
 import os
+import queue
+import threading
 import time
 
 import gradio as gr
+import numpy as np
 import requests
 
 from omni_speech.conversation import default_conversation, conv_templates
@@ -16,11 +19,25 @@ from omni_speech.tts.indicf5 import (
     DEFAULT_REFERENCE_TEXT,
     IndicF5SpeechGenerator,
 )
+from omni_speech.tts.streaming import (
+    DONE,
+    max_pass_bytes,
+    pcm16,
+    pop_sentences,
+    speak_sentences,
+    stream_bytes,
+    wav_stream_header,
+)
 
 
 logger = build_logger("gradio_web_server", "gradio_web_server.log")
 
 speech_generator = None
+# One IndicF5 pass at a time, whichever request it belongs to.
+speech_lock = threading.Lock()
+
+# The live player takes a chunk on every update; this adds nothing to the stream.
+NO_NEW_AUDIO = b""
 
 headers = {"User-Agent": "Hindi LLaMA-Omni Client"}
 
@@ -94,14 +111,19 @@ def ask_button(enabled):
     return gr.Button(interactive=enabled)
 
 
+def full_answer_audio(value=None):
+    """The replay player, shown only once the whole spoken answer exists."""
+    return gr.Audio(value=value, visible=value is not None)
+
+
 def start_request():
-    return (ask_button(False), render_status("Uploading your question…"), "", None)
+    return (ask_button(False), render_status("Uploading your question…"), "", None, full_answer_audio())
 
 
 def clear_history(request: gr.Request):
     logger.info(f"clear_history. ip: {request.client.host}")
     state = default_conversation.copy()
-    return (state, None, render_status(IDLE_STATUS, "idle"), "", None, ask_button(True))
+    return (state, None, render_status(IDLE_STATUS, "idle"), "", None, full_answer_audio(), ask_button(True))
 
 
 def get_default_reference() -> tuple[str, str]:
@@ -116,7 +138,12 @@ def synthesize_with_indicf5(text, ref_audio_path, ref_text):
     if speech_generator is None:
         return None
     try:
-        return speech_generator.synthesize(text, ref_audio_path, ref_text)
+        with speech_lock:
+            started = time.time()
+            sample_rate, audio = speech_generator.synthesize(text, ref_audio_path, ref_text)
+        logger.info(f"IndicF5 spoke {len(text)} characters ({len(audio) / sample_rate:.1f} s of speech) "
+                    f"in {time.time() - started:.1f} s")
+        return sample_rate, audio
     except Exception as exc:
         logger.exception(f"IndicF5 synthesis failed: {exc}")
         return None
@@ -132,8 +159,9 @@ def add_speech(state, speech, request: gr.Request):
 
 
 def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request: gr.Request):
-    """Yields (state, status_html, answer_text, answer_audio, ask_button_update).
+    """Yields (state, status_html, answer_text, live_audio_chunk, full_answer_audio, ask_button_update).
 
+    The answer is spoken sentence by sentence while its text is still streaming in.
     Every terminal yield re-enables the Ask button.
     """
     logger.info(f"http_bot. ip: {request.client.host}")
@@ -141,7 +169,7 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request:
         yield from _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens)
     except Exception as exc:
         logger.exception(f"http_bot failed: {exc}")
-        yield (state, render_status(UNEXPECTED_ERROR_MSG, "error"), gr.skip(), None, ask_button(True))
+        yield (state, render_status(UNEXPECTED_ERROR_MSG, "error"), gr.skip(), None, gr.skip(), ask_button(True))
 
 
 def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
@@ -151,7 +179,7 @@ def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
     if state.skip_next:
         # This generate call is skipped due to invalid inputs
         yield (state, render_status("Please record or upload a Hindi question first.", "error"),
-               "", None, ask_button(True))
+               "", None, gr.skip(), ask_button(True))
         return
 
     if len(state.messages) == state.offset + 2:
@@ -176,7 +204,7 @@ def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
     # No available worker
     if worker_addr == "":
         state.messages[-1][-1] = server_error_msg
-        yield (state, render_status(WORKER_DOWN_MSG, "error"), "", None, ask_button(True))
+        yield (state, render_status(WORKER_DOWN_MSG, "error"), "", None, gr.skip(), ask_button(True))
         return
 
     # Construct prompt
@@ -203,45 +231,100 @@ def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
     }
 
     thinking_status = render_status("Listening and thinking…")
-    yield (state, thinking_status, "", None, busy)
+    yield (state, thinking_status, "", NO_NEW_AUDIO, gr.skip(), busy)
+
+    # Finished sentences go to the speaker thread; it hands back one piece of audio per IndicF5 pass.
+    sentences, spoken = queue.Queue(), queue.Queue()
+    cancelled = threading.Event()
+    speaker = None
+    if speech_generator is not None:
+        speaker = threading.Thread(
+            target=speak_sentences,
+            args=(sentences, spoken,
+                  lambda text: synthesize_with_indicf5(text, ref_audio_path, ref_text),
+                  max_pass_bytes(ref_audio_path, ref_text), cancelled),
+            daemon=True,
+        )
+        speaker.start()
+    pieces = []  # 16-bit samples of every pass so far, in order
+    sample_rate = None
+    speech_failed = speaker is None
+
+    def new_audio(block=False):
+        """Bytes to append to the live player, and whether the speaker has finished."""
+        nonlocal sample_rate, speech_failed
+        data, finished = NO_NEW_AUDIO, False
+        while not finished:
+            try:
+                piece = spoken.get(block=block and not data)
+            except queue.Empty:
+                break
+            if piece is DONE:
+                finished = True
+            elif piece is None:
+                speech_failed = True
+            else:
+                if sample_rate is None:
+                    sample_rate = piece[0]
+                    data += wav_stream_header()
+                pieces.append(pcm16(piece[1]))
+                data += stream_bytes(piece[1], sample_rate)
+        return data, finished
 
     try:
-        # Stream output
-        response = requests.post(worker_addr + "/worker_generate_stream",
-            headers=headers, json=pload, stream=True, timeout=(10, 120))
-        output = ""
-        for chunk in response.iter_lines(decode_unicode=False, delimiter=b"\0"):
-            if chunk:
-                data = json.loads(chunk.decode())
-                if data["error_code"] == 0:
-                    output = data["text"][len(prompt):].strip()
-                    state.messages[-1][-1] = output
+        try:
+            # Stream output
+            response = requests.post(worker_addr + "/worker_generate_stream",
+                headers=headers, json=pload, stream=True, timeout=(10, 120))
+            output = ""
+            spoken_upto = 0
+            for chunk in response.iter_lines(decode_unicode=False, delimiter=b"\0"):
+                if chunk:
+                    data = json.loads(chunk.decode())
+                    if data["error_code"] == 0:
+                        output = data["text"][len(prompt):].strip()
+                        state.messages[-1][-1] = output
+                        finished_sentences, spoken_upto = pop_sentences(output, spoken_upto)
+                        for sentence in finished_sentences:
+                            sentences.put(sentence)
 
-                    yield (state, thinking_status, output, None, busy)
-                else:
-                    output = data["text"] + f" (error_code: {data['error_code']})"
-                    state.messages[-1][-1] = output
-                    logger.error(f"Worker returned error_code {data['error_code']}: {data['text']}")
-                    yield (state, render_status(
-                        f"The model could not answer this question (error code {data['error_code']}). "
-                        "Please try again.", "error"), "", None, ask_button(True))
-                    return
-                time.sleep(0.03)
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Worker request failed: {e}")
-        state.messages[-1][-1] = server_error_msg
-        yield (state, render_status(WORKER_DOWN_MSG, "error"), "", None, ask_button(True))
-        return
+                        yield (state, thinking_status, output, new_audio()[0], gr.skip(), busy)
+                    else:
+                        output = data["text"] + f" (error_code: {data['error_code']})"
+                        state.messages[-1][-1] = output
+                        logger.error(f"Worker returned error_code {data['error_code']}: {data['text']}")
+                        yield (state, render_status(
+                            f"The model could not answer this question (error code {data['error_code']}). "
+                            "Please try again.", "error"), "", None, gr.skip(), ask_button(True))
+                        return
+                    time.sleep(0.03)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Worker request failed: {e}")
+            state.messages[-1][-1] = server_error_msg
+            yield (state, render_status(WORKER_DOWN_MSG, "error"), "", None, gr.skip(), ask_button(True))
+            return
 
-    yield (state, render_status("Generating speech…"), output, None, busy)
+        # The text is complete: speak what is left after the last sentence mark.
+        if output[spoken_upto:].strip():
+            sentences.put(output[spoken_upto:].strip())
+        sentences.put(None)
+        speaking_status = render_status("Generating speech…")
+        finished = speaker is None
+        while not finished:
+            data, finished = new_audio(block=True)
+            yield (state, speaking_status, output, data, gr.skip(), busy)
+    finally:
+        # Also reached when the browser goes away mid-answer.
+        cancelled.set()
+        sentences.put(None)
 
-    return_value = synthesize_with_indicf5(output, ref_audio_path, ref_text)
-    if return_value is None:
+    if speech_failed or not pieces:
         yield (state, render_status(
             "The text answer is ready, but speech could not be generated.", "error"),
-            output, None, ask_button(True))
+            output, None, gr.skip(), ask_button(True))
     else:
-        yield (state, "", output, return_value, ask_button(True))
+        yield (state, "", output, None, full_answer_audio((sample_rate, np.concatenate(pieces))),
+               ask_button(True))
 
     logger.info(f"{output}")
     logger.info(f"IndicF5 reference transcript: {ref_text}")
@@ -349,7 +432,16 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
                     label="Answer (text)", lines=6, interactive=False,
                     show_copy_button=True, elem_id="answer",
                 )
-                audio_output_box = gr.Audio(label="Answer (speech)", autoplay=True, interactive=False)
+                # Plays the answer as it is spoken; a finished stream cannot be replayed, so the
+                # whole answer is offered again below.
+                audio_output_box = gr.Audio(
+                    label="Answer (speech)", streaming=True, autoplay=True, interactive=False,
+                    elem_id="answer-speech",
+                )
+                full_audio_output_box = gr.Audio(
+                    label="Full answer (replay / download)", interactive=False, visible=False,
+                    elem_id="answer-speech-full",
+                )
 
         if not embed_mode:
             gr.HTML(footer_html)
@@ -359,7 +451,7 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
         submit_btn.click(
             start_request,
             None,
-            [submit_btn, status_box, text_output_box, audio_output_box],
+            [submit_btn, status_box, text_output_box, audio_output_box, full_audio_output_box],
             queue=False
         ).then(
             add_speech,
@@ -368,7 +460,7 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
         ).then(
             http_bot,
             [state, model_selector, temperature, top_p, max_output_tokens],
-            [state, status_box, text_output_box, audio_output_box, submit_btn],
+            [state, status_box, text_output_box, audio_output_box, full_audio_output_box, submit_btn],
             concurrency_limit=concurrency_count
         ).then(
             # Safety net: .then runs even if a previous step failed.
@@ -381,7 +473,7 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
         clear_btn.click(
             clear_history,
             None,
-            [state, audio_input_box, status_box, text_output_box, audio_output_box, submit_btn],
+            [state, audio_input_box, status_box, text_output_box, audio_output_box, full_audio_output_box, submit_btn],
             queue=False
         )
 
@@ -413,6 +505,8 @@ def build_speech_output_backend(args):
         repo_id=args.indicf5_repo_id,
         device=args.indicf5_device,
     )
+    # Load the weights now, so the first answer does not wait for them.
+    speech_generator.model
 
 
 if __name__ == "__main__":

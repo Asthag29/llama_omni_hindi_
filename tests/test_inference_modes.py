@@ -116,6 +116,11 @@ class ModeTests(unittest.TestCase):
         )
         self.assertEqual((info.samplerate, info.frames), (24000, 2400))
 
+    def test_reference_voice_is_a_short_tracked_clip(self):
+        # IndicF5 re-reads the reference on every chunk, so a long clip slows every answer.
+        self.assertLess(sf.info(str(indicf5.DEFAULT_REFERENCE_AUDIO)).duration, 6.0)
+        self.assertTrue(indicf5.DEFAULT_REFERENCE_TEXT.strip())
+
 
 if __name__ == "__main__":
     unittest.main()
