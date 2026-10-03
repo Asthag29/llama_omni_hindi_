@@ -388,5 +388,29 @@ class RealTokenizerTests(SyntheticDataTestCase):
         self.assertEqual(int((item["input_ids"] == -200).sum()), 1)
 
 
+class WorkerImportTests(unittest.TestCase):
+    def test_stage2_has_no_imports_inside_functions(self):
+        # W&B hooks the first import of some libraries (`datasets` among them). In a
+        # forked DataLoader worker that hook waits on a W&B thread that does not exist
+        # there, so a lazy import in the data path deadlocks stage 2 at its first batch.
+        import ast
+
+        tree = ast.parse(Path(stage2.__file__).read_text(encoding="utf-8"))
+        nested = [
+            f"line {node.lineno}"
+            for scope in ast.walk(tree)
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            for node in ast.walk(scope)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+        ]
+        self.assertEqual(nested, [], "imports inside functions/classes in stage2.py")
+
+    def test_datasets_is_loaded_when_stage2_is_imported(self):
+        import sys
+
+        self.assertIn("datasets", sys.modules)
+        self.assertIn("datasets.distributed", sys.modules)
+
+
 if __name__ == "__main__":
     unittest.main()

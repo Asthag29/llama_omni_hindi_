@@ -26,6 +26,11 @@ import soundfile as sf
 import torch
 import torchaudio
 import whisper
+# Imported here, in the main process, on purpose. W&B hooks the first import of
+# `datasets`; inside a forked DataLoader worker that hook waits on a W&B thread
+# that does not exist there, and the worker deadlocks before yielding a row.
+from datasets import Audio, load_dataset
+from datasets.distributed import split_dataset_by_node
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
@@ -196,7 +201,6 @@ def _buffer_input_shards(num_files: int, num_consumers: int) -> int:
 
 def _load_parquet_dataset(data_files: list[str], split_name: str):
     """Iterable (``streaming=True``) reader over local parquet files; writes no cache."""
-    from datasets import Audio, load_dataset
 
     dataset = load_dataset(
         "parquet",
@@ -373,8 +377,6 @@ class Stage2SpeechDataset(IterableDataset):
                 ),
             )
         if self.world_size > 1:
-            from datasets.distributed import split_dataset_by_node
-
             dataset = split_dataset_by_node(dataset, rank=self.rank, world_size=self.world_size)
         yield from dataset
 
