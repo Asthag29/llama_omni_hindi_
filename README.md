@@ -209,10 +209,9 @@ python evaluations/gsm8k_hi.py
 | IFEval-Hi | Prompt strict accuracy | 19.58% | **24.41%** |
 
 Fine-tuning helps question answering, extraction, humanities, writing, and
-instruction following. The base model remains stronger on coding, math,
-reasoning, and roleplay, which are rare in the Hindi training data. Details are
-in [`evaluations/results/summary.md`](evaluations/results/summary.md); results
-for GSM8K-Hi are not published yet.
+instruction following. Details are in
+[`evaluations/results/summary.md`](evaluations/results/summary.md); results for
+GSM8K-Hi are not published yet.
 
 ## ⚠️ Limitations
 
