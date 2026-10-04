@@ -10,6 +10,11 @@ and IndicF5 speaks it.
 [![Base](https://img.shields.io/badge/Base-LLaMA--Omni-green)](https://github.com/ictnlp/LLaMA-Omni)
 [![TTS](https://img.shields.io/badge/TTS-IndicF5-orange)](https://github.com/AI4Bharat/IndicF5)
 
+![The demo answering a spoken Hindi question in text and speech](images/demo.gif)
+
+*The demo answering a spoken question, sped up about 3×. The answer is also
+spoken aloud; the recording has no sound.*
+
 ![Hindi LLaMA-Omni architecture](images/architecture.png)
 
 **Contributions**
