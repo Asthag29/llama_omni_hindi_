@@ -227,6 +227,7 @@ def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
     }
 
     thinking_status = render_status("Listening and thinking…")
+    speaking_status = render_status("Speaking the answer…")
     yield (state, thinking_status, "", NO_NEW_AUDIO, gr.skip(), busy)
 
     # Finished sentences go to the speaker thread; it hands back one piece of audio per IndicF5 pass.
@@ -295,7 +296,9 @@ def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
                         for sentence in finished_sentences:
                             sentences.put(sentence)
 
-                        yield (state, thinking_status, output, new_audio()[0], gr.skip(), busy)
+                        chunk = new_audio()[0]
+                        yield (state, speaking_status if playing else thinking_status, output, chunk,
+                               gr.skip(), busy)
                     else:
                         output = data["text"] + f" (error_code: {data['error_code']})"
                         state.messages[-1][-1] = output
@@ -315,11 +318,11 @@ def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
         if output[spoken_upto:].strip():
             sentences.put(output[spoken_upto:].strip())
         sentences.put(None)
-        speaking_status = render_status("Generating speech…")
+        preparing_status = render_status("Generating speech…")
         finished = speaker is None
         while not finished:
             data, finished = new_audio(block=True)
-            yield (state, speaking_status, output, data, gr.skip(), busy)
+            yield (state, speaking_status if playing else preparing_status, output, data, gr.skip(), busy)
     finally:
         # Also reached when the browser goes away mid-answer.
         cancelled.set()
