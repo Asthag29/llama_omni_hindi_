@@ -116,6 +116,29 @@ class ModeTests(unittest.TestCase):
         )
         self.assertEqual((info.samplerate, info.frames), (24000, 2400))
 
+    def test_own_voice_needs_the_clip_and_its_transcript_together(self):
+        self.assertEqual(indicf5.resolve_reference(),
+                         (indicf5.DEFAULT_REFERENCE_AUDIO, indicf5.DEFAULT_REFERENCE_TEXT))
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = write_wav(Path(tmp) / "my_voice.wav")
+            self.assertEqual(indicf5.resolve_reference(clip, " मेरी आवाज़ "), (clip.resolve(), "मेरी आवाज़"))
+            with self.assertRaises(ValueError):
+                indicf5.resolve_reference(clip, None)
+            with self.assertRaises(ValueError):
+                indicf5.resolve_reference(None, "मेरी आवाज़")
+            with self.assertRaises(FileNotFoundError):
+                indicf5.resolve_reference(Path(tmp) / "missing.wav", "मेरी आवाज़")
+
+    def test_synthesize_answer_uses_the_given_voice(self):
+        generator = mock.Mock()
+        generator.synthesize.return_value = (24000, np.zeros(2400, dtype=np.float32))
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "my_voice.wav"
+            inference.synthesize_answer("नमस्ते", Path(tmp) / "answer.wav", generator, clip, "मेरी आवाज़")
+        generator.synthesize.assert_called_once_with("नमस्ते", clip, "मेरी आवाज़")
+        args = self.parse("--reference-audio", "my_voice.wav", "--reference-text", "मेरी आवाज़")
+        self.assertEqual((args.reference_audio, args.reference_text), (Path("my_voice.wav"), "मेरी आवाज़"))
+
     def test_reference_voice_is_a_short_tracked_clip(self):
         # IndicF5 re-reads the reference on every chunk, so a long clip slows every answer.
         self.assertLess(sf.info(str(indicf5.DEFAULT_REFERENCE_AUDIO)).duration, 6.0)

@@ -41,6 +41,7 @@ from omni_speech.tts.indicf5 import (
     DEFAULT_REFERENCE_AUDIO,
     DEFAULT_REFERENCE_TEXT,
     IndicF5SpeechGenerator,
+    resolve_reference,
 )
 
 AUDIO_PATH = REPO_ROOT / "data" / "inference.wav"
@@ -268,9 +269,10 @@ def generate_from_wav(
     return tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
 
 
-def synthesize_answer(text: str, output_path: Path, speech_generator) -> Path:
-    """Speak the text answer in the fixed IndicF5 reference voice and save it as a wav."""
-    sample_rate, audio = speech_generator.synthesize(text, DEFAULT_REFERENCE_AUDIO, DEFAULT_REFERENCE_TEXT)
+def synthesize_answer(text: str, output_path: Path, speech_generator,
+                      ref_audio: Path = DEFAULT_REFERENCE_AUDIO, ref_text: str = DEFAULT_REFERENCE_TEXT) -> Path:
+    """Speak the text answer in the IndicF5 reference voice and save it as a wav."""
+    sample_rate, audio = speech_generator.synthesize(text, ref_audio, ref_text)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(output_path), audio, sample_rate)
     return output_path
@@ -284,6 +286,10 @@ def parse_args():
                         help="Wav to write in audio-to-audio mode (default: outputs/inference/<audio name>_answer.wav).")
     parser.add_argument("--indicf5-model-path", type=Path, default=INDICF5_MODEL_PATH)
     parser.add_argument("--indicf5-device", default=None)
+    parser.add_argument("--reference-audio", type=Path, default=None,
+                        help="Clip of the voice to answer in (default: data/reference_voice.wav).")
+    parser.add_argument("--reference-text", default=None,
+                        help="Exactly what is said in --reference-audio.")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH)
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
     parser.add_argument("--run-id", dest="run_id", default=STAGE2_RUN_ID,
@@ -307,6 +313,8 @@ def main():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
+    if args.mode == AUDIO_TO_AUDIO:
+        ref_audio, ref_text = resolve_reference(args.reference_audio, args.reference_text)
 
     checkpoint = find_stage2_checkpoint(args.checkpoint, args.run_id)
     print(f"Repo root: {REPO_ROOT}")
@@ -345,7 +353,9 @@ def main():
             model_path=args.indicf5_model_path.expanduser().resolve(),
             device=args.indicf5_device,
         )
-        output_path = synthesize_answer(response, output_path.expanduser().resolve(), speech_generator)
+        output_path = synthesize_answer(
+            response, output_path.expanduser().resolve(), speech_generator, ref_audio, ref_text
+        )
         print(f"\n=== Spoken answer ===\n{output_path}")
 
 
