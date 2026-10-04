@@ -8,9 +8,7 @@ and IndicF5 speaks it.
 [![Model](https://img.shields.io/badge/🤗%20Model-hindi--llama--omni--model-yellow)](https://huggingface.co/Pastaaaaa2003/hindi-llama-omni-model)
 [![Dataset](https://img.shields.io/badge/🤗%20Dataset-Hindi--speech--instruct-blue)](https://huggingface.co/datasets/Pastaaaaa2003/Hindi-speech-instruct)
 
-[![The demo answering a spoken Hindi question in text and speech](images/demo.png)](demo.mp4)
-
-*Click to watch the demo with sound.*
+https://github.com/user-attachments/assets/b513d7be-dd69-402a-a825-c02672de4aa1
 
 **Contributions**
 
