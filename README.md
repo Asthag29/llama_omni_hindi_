@@ -12,6 +12,16 @@ and IndicF5 speaks it.
 
 ![Hindi LLaMA-Omni architecture](images/architecture.png)
 
+**Contributions**
+
+- **Dataset:** [Hindi-speech-instruct](https://huggingface.co/datasets/Pastaaaaa2003/Hindi-speech-instruct),
+  about 110,700 spoken Hindi questions with text answers. No such dataset
+  existed, so it was built for this project ([details](#-dataset)).
+- **Model:** a [Hindi adapter and speech projector](https://huggingface.co/Pastaaaaa2003/hindi-llama-omni-model)
+  for Llama-3.1-8B-Omni, trained in two stages on that data.
+- **Speech output:** answers are spoken with IndicF5, sentence by sentence while
+  the text is still being written.
+
 ## 🛠️ Install
 
 You need Linux, Python 3.11, and an NVIDIA GPU with CUDA 12.1. Answering
@@ -93,14 +103,39 @@ the rest is still being generated; a second player offers the whole answer for
 replay once it is complete. Add `--share` to the web page command for a public
 link.
 
-With two GPUs, give the worker and the web page one each by starting them with
-`CUDA_VISIBLE_DEVICES=0` and `CUDA_VISIBLE_DEVICES=1`. In a test with two
-questions this brought the first spoken sentence down to 5–10 s after pressing
-Ask, with no pauses; on a single GPU it took 7–15 s, with an occasional pause
-after the first sentence.
+Everything runs on one GPU. The page waits until enough speech is ready to play
+the answer without pauses: with the two example questions, speech started 15–18 s
+after pressing Ask.
 
-The voice is fixed: IndicF5 clones the 5 s clip `data/reference_voice.wav`
-(set in `omni_speech/tts/indicf5.py`).
+**Answer in your own voice.** By default IndicF5 clones the 5 s clip
+`data/reference_voice.wav`. To use your own voice, record a clear WAV clip of
+about 5 s (a longer clip makes every answer slower) and start the web page with
+the clip and exactly what is said in it:
+
+```bash
+python -m omni_speech.serve.gradio_web_server --host 127.0.0.1 --port 7860 \
+  --controller-url http://127.0.0.1:21001 \
+  --reference-audio my_voice.wav --reference-text "जो वाक्य क्लिप में बोला गया है।"
+```
+
+The same two options work with `omni_speech.infer.inference --mode audio-to-audio`.
+
+## 📚 Dataset
+
+No public dataset paired spoken Hindi questions with text answers, so this
+project created one:
+[`Pastaaaaa2003/Hindi-speech-instruct`](https://huggingface.co/datasets/Pastaaaaa2003/Hindi-speech-instruct).
+
+- **Size:** about 110,700 single-turn conversations, split into 88,000 train,
+  11,220 validation, and 11,500 test.
+- **Each example:** a spoken Hindi question (FLAC, 16 kHz mono), the question
+  text, and a Hindi text answer.
+- **Text:** the single-turn Hindi conversations of
+  [`ai4bharat/indic-instruct-data-v0.1`](https://huggingface.co/datasets/ai4bharat/indic-instruct-data-v0.1):
+  Flan v2 (66,833), LMSYS (34,810), Anudesh (7,543), and HH-RLHF (1,534).
+- **Speech:** every question was spoken with
+  [`facebook/mms-tts-hin`](https://huggingface.co/facebook/mms-tts-hin).
+- **License:** CC BY 4.0. Accept the terms on the dataset page to download it.
 
 ## 🏋️ Training
 
@@ -147,20 +182,6 @@ as stage 1. Build the local copy once (about 9 GB, 20–40 minutes):
 python -m omni_speech.datasets.processing.build_stage2_local   # -> data/speech/
 ```
 
-**Results.** Each run writes `best_model/` and `final_model/` (the adapter, the
-speech projector, and metadata), plus `logs/train.log` and `csv/metrics.csv`. To
-serve a stage-2 result:
-
-```bash
-cp -rL outputs/stage_2/speech_text/best_model models/hindi
-```
-
-**Single stage.** To train speech in, text out without stage 1:
-
-```bash
-python -m omni_speech.training.stage2 --config-name speech_only
-```
-
 ## 📊 Evaluation
 
 The scripts in `evaluations/` benchmark the **text** backbone with typed Hindi
@@ -191,6 +212,8 @@ for GSM8K-Hi are not published yet.
 ## ⚠️ Limitations
 
 - Only the first 30 seconds of a spoken question are heard.
+- The training questions are machine-spoken, so unclear recordings of real voices
+  can be misheard.
 - Answers can be factually wrong, and long answers sometimes repeat themselves
   until the token limit.
 
