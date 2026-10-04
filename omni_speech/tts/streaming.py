@@ -24,6 +24,11 @@ STREAM_CHANNELS = 2
 # Shorter sentences wait for the next one: on their own they are too little audio to start playback.
 MIN_SENTENCE_CHARS = 20
 
+# A short first sentence is over long before the second pass is ready, which leaves a silent gap
+# in the middle of the answer. Playback therefore starts only once the speech in hand plus the
+# time already waited add up to this many seconds, or as soon as the second pass is ready.
+START_COVER_SECONDS = 15.0
+
 # । ? ! always end a sentence; a full stop only after a non-digit ("2." numbers a list).
 # The whitespace lookahead means the next sentence has started, so the mark is final.
 _SENTENCE_END = re.compile(r"(?:[।॥?!]+|(?<![0-9०-९])\.+)(?=\s)")
@@ -87,6 +92,13 @@ def speak_sentences(sentences: queue.Queue, audio: queue.Queue, synthesize, max_
             budget = min(max_bytes, 2 * _size(batch))
     finally:
         audio.put(DONE)
+
+
+def start_playback(passes_ready: int, seconds_ready: float, waited: float, finished: bool) -> bool:
+    """Whether the live player may start: waiting now is better than a gap after the first pass."""
+    if passes_ready == 0:
+        return False
+    return finished or passes_ready > 1 or seconds_ready + waited >= START_COVER_SECONDS
 
 
 def pcm16(samples) -> np.ndarray:

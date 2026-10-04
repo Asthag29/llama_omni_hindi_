@@ -100,6 +100,21 @@ class SpeakSentencesTests(unittest.TestCase):
         self.assertEqual(results, [streaming.DONE])
 
 
+class StartPlaybackTests(unittest.TestCase):
+    def test_a_short_first_pass_waits_for_the_second(self):
+        cover = streaming.START_COVER_SECONDS
+        self.assertFalse(streaming.start_playback(0, 0.0, 0.0, finished=False))
+        self.assertFalse(streaming.start_playback(1, 3.6, 0.0, finished=False))
+        self.assertFalse(streaming.start_playback(1, 3.6, cover - 3.7, finished=False))
+        self.assertTrue(streaming.start_playback(1, 3.6, cover - 3.6, finished=False))
+        self.assertTrue(streaming.start_playback(2, 19.5, 5.0, finished=False))
+
+    def test_a_long_first_pass_or_a_finished_answer_plays_at_once(self):
+        self.assertTrue(streaming.start_playback(1, streaming.START_COVER_SECONDS, 0.0, finished=False))
+        self.assertTrue(streaming.start_playback(1, 2.0, 0.0, finished=True))
+        self.assertFalse(streaming.start_playback(0, 0.0, 0.0, finished=True))
+
+
 class AudioFormatTests(unittest.TestCase):
     def test_default_reference_leaves_most_of_the_window_for_new_speech(self):
         budget = streaming.max_pass_bytes(indicf5.DEFAULT_REFERENCE_AUDIO, indicf5.DEFAULT_REFERENCE_TEXT)
