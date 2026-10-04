@@ -25,7 +25,7 @@ from omni_speech.infer.inference import (
     load_module_from_checkpoint,
     speech_inputs,
 )
-from transformers import TextIteratorStreamer
+from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
 from threading import Thread
 
 
@@ -143,6 +143,7 @@ class ModelWorker:
             yield json.dumps({"text": ori_prompt + "Exceeds max token length. Please start a new conversation, thanks.", "error_code": 0}).encode() + b"\0"
             return
 
+        stop = threading.Event()
         thread = Thread(target=model.generate, kwargs=dict(
             inputs=input_ids,
             do_sample=do_sample,
@@ -151,16 +152,21 @@ class ModelWorker:
             max_new_tokens=max_new_tokens,
             streamer=streamer,
             use_cache=True,
+            stopping_criteria=StoppingCriteriaList([StopWhenSet(stop)]),
             **speech_args
         ))
         thread.start()
 
         generated_text = ori_prompt
-        for new_text in streamer:
-            generated_text += new_text
-            if stop_str and generated_text.endswith(stop_str):
-                generated_text = generated_text[:-len(stop_str)]
-            yield json.dumps({"text": generated_text, "error_code": 0}).encode() + b"\0"
+        try:
+            for new_text in streamer:
+                generated_text += new_text
+                if stop_str and generated_text.endswith(stop_str):
+                    generated_text = generated_text[:-len(stop_str)]
+                yield json.dumps({"text": generated_text, "error_code": 0}).encode() + b"\0"
+        finally:
+            # Also reached when the web page stops reading (Clear was pressed): stop writing the answer.
+            stop.set()
 
     def generate_stream_gate(self, params):
         try:
@@ -187,6 +193,16 @@ class ModelWorker:
                 "error_code": 1,
             }
             yield json.dumps(ret).encode() + b"\0"
+
+
+class StopWhenSet(StoppingCriteria):
+    """Ends generation once the event is set."""
+
+    def __init__(self, event):
+        self.event = event
+
+    def __call__(self, input_ids, scores, **kwargs):
+        return torch.full((input_ids.shape[0],), self.event.is_set(), dtype=torch.bool, device=input_ids.device)
 
 
 app = FastAPI()

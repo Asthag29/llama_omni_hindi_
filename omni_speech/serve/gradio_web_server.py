@@ -39,6 +39,8 @@ speech_generator = None
 reference_voice = (str(DEFAULT_REFERENCE_AUDIO), DEFAULT_REFERENCE_TEXT)
 # One IndicF5 pass at a time, whichever request it belongs to.
 speech_lock = threading.Lock()
+# The stop signal of the answer each browser session is waiting for; Clear sets it.
+running_answers = {}
 
 # The live player takes a chunk on every update; this adds nothing to the stream.
 NO_NEW_AUDIO = b""
@@ -126,6 +128,9 @@ def start_request():
 
 def clear_history(request: gr.Request):
     logger.info(f"clear_history. ip: {request.client.host}")
+    stop = running_answers.pop(request.session_hash, None)
+    if stop is not None:
+        stop.set()
     state = default_conversation.copy()
     return (state, None, render_status(IDLE_STATUS, "idle"), "", None, full_answer_audio(), ask_button(True))
 
@@ -158,19 +163,26 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request:
     """Yields (state, status_html, answer_text, live_audio_chunk, full_answer_audio, ask_button_update).
 
     The answer is spoken sentence by sentence while its text is still streaming in.
-    Every terminal yield re-enables the Ask button.
+    Every terminal yield re-enables the Ask button. Clear stops the answer: it sets the
+    session's entry in running_answers.
     """
     logger.info(f"http_bot. ip: {request.client.host}")
+    cancelled = threading.Event()
     try:
-        yield from _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens)
+        yield from _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens,
+                                    cancelled, request.session_hash)
     except Exception as exc:
         logger.exception(f"http_bot failed: {exc}")
         yield (state, render_status(UNEXPECTED_ERROR_MSG, "error"), gr.skip(), None, gr.skip(), ask_button(True))
 
 
-def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
+def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens, cancelled, session):
     model_name = model_selector
     busy = gr.skip()
+
+    if not state.messages:
+        # Clear was pressed before the answer started.
+        return
 
     if state.skip_next:
         # This generate call is skipped due to invalid inputs
@@ -226,13 +238,13 @@ def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
         "audio": audio,
     }
 
-    thinking_status = render_status("Listening and thinking…")
+    processing_status = render_status("Processing…")
     speaking_status = render_status("Speaking the answer…")
-    yield (state, thinking_status, "", NO_NEW_AUDIO, gr.skip(), busy)
+    yield (state, processing_status, "", NO_NEW_AUDIO, gr.skip(), busy)
 
     # Finished sentences go to the speaker thread; it hands back one piece of audio per IndicF5 pass.
     sentences, spoken = queue.Queue(), queue.Queue()
-    cancelled = threading.Event()
+    running_answers[session] = cancelled
     speaker = None
     if speech_generator is not None:
         speaker = threading.Thread(
@@ -249,6 +261,9 @@ def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
 
     # The first audio is kept back until start_playback() allows it, so the answer plays without a gap.
     playing, held, first_ready = False, NO_NEW_AUDIO, None
+    # The text starts with the speech and is then written at the pace it came from the model.
+    arrivals = []  # (time, length of the answer) for every update from the worker
+    shown, text_delay = 0, None  # updates shown so far; how far the page runs behind the model
 
     def new_audio(block=False):
         """Bytes to append to the live player, and whether the speaker has finished."""
@@ -256,8 +271,9 @@ def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
         data, finished = NO_NEW_AUDIO, False
         while not finished:
             try:
-                # While playback is kept back, return regularly to check whether it may start.
-                piece = spoken.get(block=block and not data, timeout=None if playing else 0.25)
+                # While playback is kept back or text is still to be shown, return regularly.
+                piece = spoken.get(block=block and not data,
+                                   timeout=None if playing and shown == len(arrivals) else 0.1)
             except queue.Empty:
                 break
             if piece is DONE:
@@ -279,25 +295,43 @@ def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
                 playing, data, held = True, held, NO_NEW_AUDIO
         return data, finished
 
+    def visible_text():
+        """The answer text for the page: nothing until the speech starts, then written as it arrived."""
+        nonlocal shown, text_delay
+        if speech_failed:
+            shown = len(arrivals)
+            return output
+        if not playing or not arrivals:
+            return ""
+        if text_delay is None:
+            text_delay = time.time() - arrivals[0][0]
+        while shown < len(arrivals) and arrivals[shown][0] <= time.time() - text_delay:
+            shown += 1
+        return output[:arrivals[shown - 1][1]] if shown else ""
+
+    output = ""
+    response = None
     try:
         try:
             # Stream output
             response = requests.post(worker_addr + "/worker_generate_stream",
                 headers=headers, json=pload, stream=True, timeout=(10, 120))
-            output = ""
             spoken_upto = 0
             for chunk in response.iter_lines(decode_unicode=False, delimiter=b"\0"):
+                if cancelled.is_set():
+                    return
                 if chunk:
                     data = json.loads(chunk.decode())
                     if data["error_code"] == 0:
                         output = data["text"][len(prompt):].strip()
+                        arrivals.append((time.time(), len(output)))
                         state.messages[-1][-1] = output
                         finished_sentences, spoken_upto = pop_sentences(output, spoken_upto)
                         for sentence in finished_sentences:
                             sentences.put(sentence)
 
                         chunk = new_audio()[0]
-                        yield (state, speaking_status if playing else thinking_status, output, chunk,
+                        yield (state, speaking_status if playing else processing_status, visible_text(), chunk,
                                gr.skip(), busy)
                     else:
                         output = data["text"] + f" (error_code: {data['error_code']})"
@@ -318,15 +352,28 @@ def _http_bot_stream(state, model_selector, temperature, top_p, max_new_tokens):
         if output[spoken_upto:].strip():
             sentences.put(output[spoken_upto:].strip())
         sentences.put(None)
-        preparing_status = render_status("Generating speech…")
         finished = speaker is None
-        while not finished:
-            data, finished = new_audio(block=True)
-            yield (state, speaking_status if playing else preparing_status, output, data, gr.skip(), busy)
+        while not finished or (playing and shown < len(arrivals)):
+            if cancelled.is_set():
+                return
+            if finished:
+                # The speech is complete; keep writing the rest of the text.
+                data = NO_NEW_AUDIO
+                time.sleep(0.1)
+            else:
+                data, finished = new_audio(block=True)
+            yield (state, speaking_status if playing else processing_status, visible_text(), data, gr.skip(), busy)
+        if cancelled.is_set():
+            return
     finally:
-        # Also reached when the browser goes away mid-answer.
+        # Also reached when Clear is pressed or the browser goes away mid-answer. Closing the
+        # request makes the worker stop writing; the speaker stops after the pass it is on.
         cancelled.set()
         sentences.put(None)
+        if response is not None:
+            response.close()
+        if running_answers.get(session) is cancelled:
+            del running_answers[session]
 
     if speech_failed or not pieces:
         yield (state, render_status(
@@ -459,7 +506,7 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
 
         url_params = gr.JSON(visible=False)
 
-        submit_btn.click(
+        answer_event = submit_btn.click(
             start_request,
             None,
             [submit_btn, status_box, text_output_box, audio_output_box, full_audio_output_box],
@@ -473,7 +520,8 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
             [state, model_selector, temperature, top_p, max_output_tokens],
             [state, status_box, text_output_box, audio_output_box, full_audio_output_box, submit_btn],
             concurrency_limit=concurrency_count
-        ).then(
+        )
+        answer_event.then(
             # Safety net: .then runs even if a previous step failed.
             lambda: ask_button(True),
             None,
@@ -485,7 +533,8 @@ def build_demo(embed_mode, cur_dir=None, concurrency_count=10):
             clear_history,
             None,
             [state, audio_input_box, status_box, text_output_box, audio_output_box, full_audio_output_box, submit_btn],
-            queue=False
+            queue=False,
+            cancels=[answer_event],
         )
 
         if args.model_list_mode == "once":
