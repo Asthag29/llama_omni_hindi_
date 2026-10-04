@@ -10,12 +10,9 @@ and IndicF5 speaks it.
 [![Base](https://img.shields.io/badge/Base-LLaMA--Omni-green)](https://github.com/ictnlp/LLaMA-Omni)
 [![TTS](https://img.shields.io/badge/TTS-IndicF5-orange)](https://github.com/AI4Bharat/IndicF5)
 
-![The demo answering a spoken Hindi question in text and speech](images/demo.gif)
+[![The demo answering a spoken Hindi question in text and speech](images/demo.png)](demo.mp4)
 
-*The demo answering a spoken question, sped up about 3×. The answer is also
-spoken aloud; the recording has no sound.*
-
-![Hindi LLaMA-Omni architecture](images/architecture.png)
+*Click to watch the demo with sound.*
 
 **Contributions**
 
@@ -102,15 +99,8 @@ python -m omni_speech.serve.gradio_web_server --host 127.0.0.1 --port 7860 \
   --controller-url http://127.0.0.1:21001
 ```
 
-Open <http://127.0.0.1:7860/> and record or upload a Hindi question. The page
-shows the Hindi text as it is written and speaks each finished sentence while
-the rest is still being generated; a second player offers the whole answer for
-replay once it is complete. Add `--share` to the web page command for a public
-link.
-
-Everything runs on one GPU. The page waits until enough speech is ready to play
-the answer without pauses: with the two example questions, speech started 15–18 s
-after pressing Ask.
+Open <http://127.0.0.1:7860/> and record or upload a Hindi question. Add
+`--share` to the web page command for a public link.
 
 **Answer in your own voice.** By default IndicF5 clones the 5 s clip
 `data/reference_voice.wav`. To use your own voice, record a clear WAV clip of
