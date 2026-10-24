@@ -15,9 +15,9 @@ https://github.com/user-attachments/assets/b513d7be-dd69-402a-a825-c02672de4aa1
 - **Dataset:** [Hindi-speech-instruct](https://huggingface.co/datasets/Pastaaaaa2003/Hindi-speech-instruct),
   about 110,700 spoken Hindi questions with text answers. No such dataset
   existed, so it was built for this project ([details](#-dataset)).
-- **Model:** a [Hindi adapter and speech projector](https://huggingface.co/Pastaaaaa2003/hindi-llama-omni-model)
-  for Llama-3.1-8B-Omni, trained in two stages on that data.
-- **Speech output:** answers are spoken with IndicF5, sentence by sentence while
+- **Model:** a [Hindi Lora adapter and speech projector](https://huggingface.co/Pastaaaaa2003/hindi-llama-omni-model)
+  built on Llama-3.1-8B-Omni.
+- **Speech output:** tts used IndicF5, sentence by sentence while
   the text is still being written.
 
 ## 🛠️ Install
@@ -130,8 +130,7 @@ project created one:
 
 ## 🏋️ Training
 
-Training the speech projector and the backbone together from the English
-weights was unstable for Hindi, so it runs in two stages.
+Training the speech projector and the backbone together from the English weights was unstable for Hindi, so it was trained in two stages. Since the LLama omni instruct model already have been trained to act as a chatbot, i did not want to loose that quality. Hence instead of using the base llama model , i used the instruct Llama omni model trained on English Language. In the first stage, my goal was to teach the backbone(Llama) Hindi language. Llama models have already been pretrained on huge corpus of public data which included Hindi, but during the training of the Llama omni model, most of it's hindi capabilities was lost. So in the first stage of training Lora adaptor were added and it was trained on the Hindi corpus with the backbone being frozon. And then in the second stage the speech project/adaptor(MLP layer) was used to align the speech embedding with the text embedding of the Hindi data. 
 
 | | Stage 1 | Stage 2 |
 | --- | --- | --- |
@@ -142,7 +141,7 @@ weights was unstable for Hindi, so it runs in two stages.
 | Starts from | `models/llama` | stage-1 `best_model` |
 | Writes to | `outputs/stage_1/backbone_text/` | `outputs/stage_2/speech_text/` |
 
-Whisper stays frozen in both stages. Settings shared by both: LoRA `r=128`,
+Whisper encoder stays frozen in both stages. Settings shared by both: LoRA `r=128`,
 `alpha=64`; learning rate `1e-4` with warmup and cosine decay; batch size 2 × 7
 accumulation steps; 3 epochs; `bf16-mixed` precision (keep it: the trainable
 weights must stay in fp32). Each stage runs on one GPU and needs about 29 GB.
